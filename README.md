@@ -1,2 +1,2 @@
 # Quill
-A tiny programming language.
+A toy interpreted programming language.
