@@ -53,13 +53,6 @@ enum Builtin {
     Not,
     Cons,
     Append,
-    Head,
-    Tail,
-    Length,
-    Map,
-    Filter,
-    Foldl,
-    Foldr,
     Show,
     Println,
     Error,
@@ -83,10 +76,7 @@ impl Builtin {
             | Builtin::And
             | Builtin::Or
             | Builtin::Cons
-            | Builtin::Append
-            | Builtin::Map
-            | Builtin::Filter => 2,
-            Builtin::Foldl | Builtin::Foldr => 3,
+            | Builtin::Append => 2,
             _ => 1,
         }
     }
@@ -180,22 +170,6 @@ impl Value {
                 name: name.clone(),
             },
         }
-    }
-
-    fn is_copy(&self) -> bool {
-        matches!(
-            self,
-            Value::Int(_)
-                | Value::Float(_)
-                | Value::Bool(_)
-                | Value::Char(_)
-                | Value::Ref { .. }
-                | Value::Func(_)
-                | Value::Builtin(_)
-                | Value::CtorFn { .. }
-                | Value::Method { .. }
-                | Value::Partial { .. }
-        )
     }
 }
 
@@ -395,24 +369,17 @@ impl<'a> Eval<'a> {
             .lookup(env, name)
             .ok_or_else(|| rt_err(format!("unbound name `{name}`"), span))?;
         self.force(&cell, span)?;
-        let mut c = cell.borrow_mut();
+        let c = cell.borrow();
         match &c.value {
-            None => Err(rt_err(format!("use of moved value `{name}`"), span)),
-            Some(v) if v.is_copy() => Ok(v.clone()),
-            Some(_) => Ok(c.value.take().unwrap()),
+            None => Err(rt_err(format!("use of uninitialized value `{name}`"), span)),
+            // Values are shareable (immutability makes this safe); the cell
+            // is not consumed.
+            Some(v) => Ok(v.deep_clone()),
         }
     }
 
     fn peek_var(&self, env: &Env, name: &str, span: Span) -> Result<Value, Diagnostic> {
-        let cell = self
-            .lookup(env, name)
-            .ok_or_else(|| rt_err(format!("unbound name `{name}`"), span))?;
-        self.force(&cell, span)?;
-        let c = cell.borrow();
-        match &c.value {
-            None => Err(rt_err(format!("use of moved value `{name}`"), span)),
-            Some(v) => Ok(v.deep_clone()),
-        }
+        self.read_var(env, name, span)
     }
 
     /// Lazily evaluate a nullary function cell (a "thunk") in place.
@@ -634,10 +601,19 @@ impl<'a> Eval<'a> {
                 })
             }
             Expr::Ascribe(e, _, _) => self.eval(env, e),
+            Expr::Qualified(q, m, span) => Err(rt_err(
+                format!("unresolved qualified name `{q}.{m}`"),
+                *span,
+            )),
         }
     }
 
     fn ctor_value(&self, name: &str) -> Result<Value, Diagnostic> {
+        match name {
+            "True" => return Ok(Value::Bool(true)),
+            "False" => return Ok(Value::Bool(false)),
+            _ => {}
+        }
         let (adt_id, ctor_idx) = *self
             .info
             .ctor_by_name
@@ -762,59 +738,6 @@ impl<'a> Eval<'a> {
                 }
                 _ => Err(rt_err("`++` expects two lists or two strings", span)),
             },
-            Builtin::Head => match &args[0] {
-                Value::List(xs) if !xs.is_empty() => Ok(xs[0].clone()),
-                _ => Err(rt_err("`head` of empty list", span)),
-            },
-            Builtin::Tail => match &args[0] {
-                Value::List(xs) if !xs.is_empty() => {
-                    let mut v = xs.clone();
-                    v.remove(0);
-                    Ok(Value::List(v))
-                }
-                _ => Err(rt_err("`tail` of empty list", span)),
-            },
-            Builtin::Length => match &args[0] {
-                Value::List(xs) => Ok(Value::Int(xs.len() as i64)),
-                Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-                _ => Err(rt_err("`length` expects a list or string", span)),
-            },
-            Builtin::Map => {
-                let list = expect_list(&args[1], span)?;
-                let mut out = Vec::new();
-                for x in list {
-                    out.push(self.apply(args[0].clone(), x, span)?);
-                }
-                Ok(Value::List(out))
-            }
-            Builtin::Filter => {
-                let list = expect_list(&args[1], span)?;
-                let mut out = Vec::new();
-                for x in list {
-                    if matches!(self.apply(args[0].clone(), x.clone(), span)?, Value::Bool(true)) {
-                        out.push(x);
-                    }
-                }
-                Ok(Value::List(out))
-            }
-            Builtin::Foldl => {
-                let list = expect_list(&args[2], span)?;
-                let mut acc = args[1].clone();
-                for x in list {
-                    let f_acc = self.apply(args[0].clone(), acc, span)?;
-                    acc = self.apply(f_acc, x, span)?;
-                }
-                Ok(acc)
-            }
-            Builtin::Foldr => {
-                let list = expect_list(&args[2], span)?;
-                let mut acc = args[1].clone();
-                for x in list.into_iter().rev() {
-                    let f_x = self.apply(args[0].clone(), x, span)?;
-                    acc = self.apply(f_x, acc, span)?;
-                }
-                Ok(acc)
-            }
             Builtin::Show => Ok(Value::Str(format_value(&args[0]))),
             Builtin::Println => {
                 self.output.borrow_mut().push_str(&format_value(&args[0]));
@@ -983,13 +906,6 @@ fn ordering(b: Builtin, a: &Value, b2: &Value, span: Span) -> Result<Value, Diag
     Ok(Value::Bool(r))
 }
 
-fn expect_list(v: &Value, span: Span) -> Result<Vec<Value>, Diagnostic> {
-    match v {
-        Value::List(xs) => Ok(xs.clone()),
-        _ => Err(rt_err("expected a list", span)),
-    }
-}
-
 fn bindings_scope(bindings: Vec<(String, Value)>) -> Scope {
     let mut scope = Scope::new();
     for (n, v) in bindings {
@@ -1032,6 +948,9 @@ fn match_pattern(pat: &Pattern, value: Value, out: &mut Vec<(String, Value)>) ->
         Pattern::Str(s, _) => matches!(value, Value::Str(x) if &x == s),
         Pattern::Char(c, _) => matches!(value, Value::Char(x) if x == *c),
         Pattern::Ctor { name, args, .. } => {
+            if args.is_empty() && (name == "True" || name == "False") {
+                return matches!(value, Value::Bool(b) if name == if b { "True" } else { "False" });
+            }
             if let Value::Adt { ctor, fields, .. } = value {
                 if &ctor != name || fields.len() != args.len() {
                     return false;
@@ -1135,13 +1054,6 @@ fn install_prelude(global: &mut Scope, info: &ProgramInfo) {
         ("not", Builtin::Not),
         (":", Builtin::Cons),
         ("++", Builtin::Append),
-        ("head", Builtin::Head),
-        ("tail", Builtin::Tail),
-        ("length", Builtin::Length),
-        ("map", Builtin::Map),
-        ("filter", Builtin::Filter),
-        ("foldl", Builtin::Foldl),
-        ("foldr", Builtin::Foldr),
         ("show", Builtin::Show),
         ("println", Builtin::Println),
         ("error", Builtin::Error),
@@ -1201,8 +1113,12 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn format_value(v: &Value) -> String {
-    match v {
+/// Strip a module prefix, leaving the final name component.
+fn short_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+fn format_value(v: &Value) -> String {    match v {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => {
             if f.fract() == 0.0 {
@@ -1224,6 +1140,7 @@ fn format_value(v: &Value) -> String {
             format!("({inner})")
         }
         Value::Adt { ctor, fields, record, .. } => {
+            let ctor = short_name(ctor);
             if !record.is_empty() {
                 let inner = record
                     .iter()
@@ -1232,7 +1149,7 @@ fn format_value(v: &Value) -> String {
                     .join(", ");
                 format!("{ctor} {{ {inner} }}")
             } else if fields.is_empty() {
-                ctor.clone()
+                ctor.to_string()
             } else {
                 let inner = fields.iter().map(format_value).collect::<Vec<_>>().join(" ");
                 format!("{ctor} {inner}")

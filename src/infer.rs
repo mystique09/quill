@@ -153,7 +153,10 @@ impl Infer {
                 Some(VarState::Link(t)) => self.resolve(t.clone()),
                 _ => Ty::Var(id),
             },
-            other => other,
+            Ty::Con(tc, args) => Ty::Con(
+                tc,
+                args.iter().map(|a| self.resolve(a.clone())).collect(),
+            ),
         }
     }
 
@@ -659,22 +662,23 @@ impl Infer {
             Scheme { vars: vec![a], constraints: num_ctr(Ty::Var(a)), ty: Ty::func(Ty::Var(a), Ty::Var(a)) },
         ));
 
-        // Eq / Ord / Show / Append methods. Each scheme quantifies a single
-        // type variable that also appears in its type and constraint.
+        // Structural comparison, ordering, and formatting are builtins that
+        // work on any value (immutability makes deep comparison safe), so
+        // they are unconstrained. `++` requires the `Append` class.
         let a = self.new_var();
-        let e = Scheme { vars: vec![a], constraints: vec![Constraint { class: "Eq".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
+        let e = Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
         let a = self.new_var();
-        let ne = Scheme { vars: vec![a], constraints: vec![Constraint { class: "Eq".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
+        let ne = Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
         let a = self.new_var();
-        let lt = Scheme { vars: vec![a], constraints: vec![Constraint { class: "Ord".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
+        let lt = Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
         let a = self.new_var();
-        let le = Scheme { vars: vec![a], constraints: vec![Constraint { class: "Ord".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
+        let le = Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
         let a = self.new_var();
-        let gt = Scheme { vars: vec![a], constraints: vec![Constraint { class: "Ord".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
+        let gt = Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
         let a = self.new_var();
-        let ge = Scheme { vars: vec![a], constraints: vec![Constraint { class: "Ord".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
+        let ge = Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::bool())) };
         let a = self.new_var();
-        let show = Scheme { vars: vec![a], constraints: vec![Constraint { class: "Show".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::string()) };
+        let show = Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::string()) };
         let a = self.new_var();
         let app = Scheme { vars: vec![a], constraints: vec![Constraint { class: "Append".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::func(Ty::Var(a), Ty::Var(a))) };
 
@@ -704,24 +708,7 @@ impl Infer {
         prelude.push(("not".into(), Scheme::mono(Ty::func(Ty::bool(), Ty::bool()))));
 
         let a = self.new_var();
-        let b = self.new_var();
-        prelude.push(("map".into(), Scheme { vars: vec![a, b], constraints: vec![], ty: Ty::func(Ty::func(Ty::Var(a), Ty::Var(b)), Ty::func(Ty::list(Ty::Var(a)), Ty::list(Ty::Var(b)))) }));
-        let a = self.new_var();
-        prelude.push(("filter".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::func(Ty::Var(a), Ty::bool()), Ty::func(Ty::list(Ty::Var(a)), Ty::list(Ty::Var(a)))) }));
-        let a = self.new_var();
-        prelude.push(("head".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::list(Ty::Var(a)), Ty::Var(a)) }));
-        let a = self.new_var();
-        prelude.push(("tail".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::list(Ty::Var(a)), Ty::list(Ty::Var(a))) }));
-        let a = self.new_var();
-        prelude.push(("length".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::list(Ty::Var(a)), Ty::int()) }));
-        let a = self.new_var();
-        let b = self.new_var();
-        prelude.push(("foldl".into(), Scheme { vars: vec![a, b], constraints: vec![], ty: Ty::func(Ty::func(Ty::Var(b), Ty::func(Ty::Var(a), Ty::Var(b))), Ty::func(Ty::Var(b), Ty::func(Ty::list(Ty::Var(a)), Ty::Var(b)))) }));
-        let a = self.new_var();
-        let b = self.new_var();
-        prelude.push(("foldr".into(), Scheme { vars: vec![a, b], constraints: vec![], ty: Ty::func(Ty::func(Ty::Var(a), Ty::func(Ty::Var(b), Ty::Var(b))), Ty::func(Ty::Var(b), Ty::func(Ty::list(Ty::Var(a)), Ty::Var(b)))) }));
-        let a = self.new_var();
-        prelude.push(("println".into(), Scheme { vars: vec![a], constraints: vec![Constraint { class: "Show".into(), ty: Ty::Var(a) }], ty: Ty::func(Ty::Var(a), Ty::unit()) }));
+        prelude.push(("println".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::unit()) }));
         prelude.push(("sqrt".into(), Scheme::mono(Ty::func(Ty::float(), Ty::float()))));
         let a = self.new_var();
         prelude.push(("error".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::string(), Ty::Var(a)) }));
@@ -796,12 +783,8 @@ impl Infer {
                 };
                 let mut ctx = Vec::new();
                 for c in context {
-                    let mut m = HashMap::new();
-                    if let Ok(cty) = self.convert_type(c, &mut m) {
-                        ctx.push(Constraint {
-                            class: self.constraint_class(c),
-                            ty: cty,
-                        });
+                    if let Some(cn) = self.convert_constraint(c) {
+                        ctx.push(cn);
                     }
                 }
                 self.instances.push(InstanceInfo {
@@ -926,9 +909,8 @@ impl Infer {
                 let _ = self.unify(inferred.clone(), declared.clone(), sig.span);
             }
             for c in &sig.constraints {
-                let mut m2 = HashMap::new();
-                if let Ok(cty) = self.convert_type(c, &mut m2) {
-                    self.add_constraint(self.constraint_class(c), cty);
+                if let Some(cn) = self.convert_constraint(c) {
+                    self.add_constraint(cn.class, cn.ty);
                 }
             }
         }
@@ -959,10 +941,21 @@ impl Infer {
         args
     }
 
-    fn constraint_class(&self, c: &Type) -> String {
+    /// Convert a class constraint of the form `C ty1 ... tyn` into a
+    /// `Constraint`, converting only the argument types (the class name is
+    /// not a type constructor).
+    fn convert_constraint(&mut self, c: &Type) -> Option<Constraint> {
         match c {
-            Type::Con(name, _, _) => name.clone(),
-            _ => String::new(),
+            Type::Con(class, args, _) => {
+                let arg = args.first()?.clone();
+                let mut map = HashMap::new();
+                let ty = self.convert_type(&arg, &mut map).ok()?;
+                Some(Constraint {
+                    class: class.clone(),
+                    ty,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -1010,6 +1003,9 @@ impl Infer {
             Pattern::Str(_, _) => Some(Ty::string()),
             Pattern::Char(_, _) => Some(Ty::char()),
             Pattern::Ctor { name, args, span } => {
+                if (name == "True" || name == "False") && args.is_empty() {
+                    return Some(Ty::bool());
+                }
                 let (adt_id, ctor_idx) = *self.ctor_map.get(name)?;
                 let params = self.adts[adt_id].params.clone();
                 let fields = self.adts[adt_id].ctors[ctor_idx].fields.clone();
@@ -1235,6 +1231,14 @@ impl Infer {
                 }
             }
             Expr::Clone(e, _) => self.infer_expr(e),
+            Expr::Qualified(q, m, span) => {
+                self.errors.push(Diagnostic::error(
+                    3015,
+                    format!("unresolved qualified name `{q}.{m}`"),
+                    Some(*span),
+                ));
+                None
+            }
             Expr::Record { ctor, fields, span } => {
                 let (adt_id, ctor_idx) = *self.ctor_map.get(ctor)?;
                 let def = self.adts[adt_id].clone();
@@ -1299,6 +1303,9 @@ impl Infer {
     }
 
     fn infer_ctor(&mut self, name: &str, span: Span) -> Option<Ty> {
+        if name == "True" || name == "False" {
+            return Some(Ty::bool());
+        }
         let (adt_id, ctor_idx) = *self.ctor_map.get(name)?;
         let def = self.adts[adt_id].clone();
         let ctor = def.ctors[ctor_idx].clone();
