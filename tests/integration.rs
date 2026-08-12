@@ -143,3 +143,25 @@ fn missing_module() {
     let msg = r.unwrap_err().into_iter().map(|d| d.message).collect::<Vec<_>>().join("; ");
     assert!(msg.contains("not found"), "got: {msg}");
 }
+
+#[test]
+fn native_compile() {
+    // The native backend compiles a small program to object code without
+    // errors. (Linking and running is exercised manually via `quill build`.)
+    let dir = std::env::temp_dir().join("quill_native_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fact.q");
+    std::fs::write(
+        &path,
+        "factorial 0 = 1\nfactorial n = n * factorial (n - 1)\nmain = factorial 5\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    // The generated object references the compiled function symbol.
+    let has_symbol = object
+        .windows(b"q_factorial".len())
+        .any(|w| w == b"q_factorial");
+    assert!(has_symbol, "object missing `q_factorial` symbol");
+    let _ = std::fs::remove_dir_all(&dir);
+}
