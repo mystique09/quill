@@ -181,6 +181,14 @@ Quill code in `Std.List`, which is imported implicitly.
 If a top-level binding named `main` exists it is evaluated and, when it yields a
 non-unit value, that value is printed. `println` writes directly to stdout.
 
+## Compiling to native code
+
+`quill build file.q [output]` compiles a program to a native executable using
+Cranelift. The compiler currently supports `Int`, `Bool`, arithmetic and
+comparison, `if`, top-level function calls (uncurried), recursion, and `Int`
+pattern matching. The compiled `main` returns its result as the process exit
+code. ADTs, lists, closures, strings, and the standard library are coming.
+
 ## Known simplifications
 
 - `let` and `where` are non-recursive (top-level functions *are* recursive).

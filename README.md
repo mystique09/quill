@@ -18,8 +18,9 @@ that make Rust great:
   with `&`/`&mut` borrows. Memory is managed by automatic reference counting.
 - **No `null`** — use `Option` and `Result` instead.
 
-Quill is a tree-walking interpreter. It lexes, parses, type-checks, and then
-evaluates your program.
+Quill is a tree-walking interpreter with a native compiler backend (Cranelift).
+The interpreter runs `.q` files or a REPL; `quill build` compiles a program to a
+native executable.
 
 ## Quick start
 
@@ -27,6 +28,7 @@ evaluates your program.
 $ cargo run -- examples/hello.q
 Hello, world!
 
+$ cargo run -- build examples/recursion.q quill-fact   # native binary
 $ cargo run              # start the REPL
 ```
 
@@ -82,6 +84,7 @@ See [docs/LANGUAGE.md](docs/LANGUAGE.md) for the full language reference.
 | `src/types.rs`    | Type representation |
 | `src/infer.rs`    | Hindley–Milner type inference + type classes |
 | `src/modules.rs`  | Module loader (imports, export lists, name resolution) |
+| `src/compile.rs`  | Native codegen via Cranelift (`quill build`) |
 | `src/ownership.rs`| Mutability checker |
 | `src/eval.rs`     | Tree-walking interpreter |
 | `src/error.rs`    | rustc-style diagnostics |
