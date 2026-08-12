@@ -1,38 +1,31 @@
 use std::io::{self, Write};
+use std::path::Path;
 
 use quill::error::render;
-use quill::run;
+use quill::{run, run_file};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
-        let path = &args[1];
-        match std::fs::read_to_string(path) {
-            Ok(src) => {
-                run_and_report(&src);
+        let path = Path::new(&args[1]);
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("error: could not read `{}`: {e}", path.display());
+            std::process::exit(1);
+        });
+        match run_file(path) {
+            Ok(output) => {
+                print!("{output}");
+                io::stdout().flush().ok();
             }
-            Err(e) => {
-                eprintln!("error: could not read `{path}`: {e}");
+            Err(diags) => {
+                for d in &diags {
+                    eprint!("{}", render(&src, d));
+                }
                 std::process::exit(1);
             }
         }
     } else {
         repl();
-    }
-}
-
-fn run_and_report(src: &str) {
-    match run(src) {
-        Ok(output) => {
-            print!("{output}");
-            io::stdout().flush().ok();
-        }
-        Err(diags) => {
-            for d in &diags {
-                eprint!("{}", render(src, d));
-            }
-            std::process::exit(1);
-        }
     }
 }
 
@@ -53,11 +46,17 @@ fn repl() {
         if line.is_empty() {
             continue;
         }
-        // Heuristic: a line with a top-level `=` (but no `in`) is a
-        // definition; otherwise treat it as an expression to evaluate.
-        let is_def = line.contains('=')
-            && !line.contains(" in ")
-            && !line.starts_with("let ");
+        // Heuristic: a declaration (`use`, `data`, `class`, …) or a line with
+        // a top-level `=` (but no `in`) is a definition; otherwise treat it
+        // as an expression to evaluate.
+        let trimmed = line.trim_start();
+        let is_decl_kw = ["use ", "module ", "data ", "type ", "class ", "instance "]
+            .iter()
+            .any(|k| trimmed.starts_with(k));
+        let is_def = is_decl_kw
+            || (line.contains('=')
+                && !line.contains(" in ")
+                && !line.starts_with("let "));
         let src = if is_def {
             defs.push_str(line);
             defs.push('\n');
