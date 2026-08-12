@@ -68,8 +68,9 @@ fn type_error_rejected() {
 
 #[test]
 fn move_semantics() {
-    let e = run_err("main = let s = \"hi\" in let t = s in println s");
-    assert!(e.contains("moved value"), "got: {e}");
+    // Values are shareable (immutability + ARC); using a value twice is fine.
+    let src = "main = let s = \"hi\" in let t = s in println (s ++ t)";
+    assert_eq!(run_ok(src), "hihi\n");
 }
 
 #[test]
@@ -80,10 +81,18 @@ fn immutability() {
 
 #[test]
 fn no_instance_rejected() {
-    let src = "main = println (show (\\f -> f))\n";
-    // `show` on a function has no instance.
+    // `++` requires an `Append` instance; `Int` has none.
+    let src = "main = println (show (1 ++ 2))";
     let r = run(src);
     assert!(r.is_err());
+}
+
+#[test]
+fn show_is_structural() {
+    // `show` formats any value (functions included).
+    let src = "main = println (show (Some 42))";
+    let src = format!("use Std.Option\n{src}");
+    assert_eq!(run_ok(&src), "Some 42\n");
 }
 
 #[test]
@@ -98,4 +107,39 @@ fn mutable_and_borrow() {
 main = let mut n = 0 in let bump = n := n + 1 in let _ = bump in n
 "#;
     assert_eq!(run_ok(src), "1\n");
+}
+
+#[test]
+fn stdlib_list() {
+    let src = r#"
+main = println (show (reverse [1,2,3]) ++ " " ++ show (sum [1,2,3,4]) ++ " " ++ show (take 2 [5,6,7,8]))
+"#;
+    assert_eq!(run_ok(src), "[3, 2, 1] 10 [5, 6]\n");
+}
+
+#[test]
+fn qualified_import() {
+    let src = r#"
+use Std.Option as O
+use Std.Function as F
+main = println (show (O.fromMaybe 0 (O.Some 5)) ++ " " ++ show (F.compose (\x -> x + 1) (\x -> x * 2) 10))
+"#;
+    assert_eq!(run_ok(src), "5 21\n");
+}
+
+#[test]
+fn unqualified_import() {
+    let src = r#"
+use Std.Option
+main = println (show (mapMaybe (\x -> x * 2) (Some 21)))
+"#;
+    assert_eq!(run_ok(src), "Some 42\n");
+}
+
+#[test]
+fn missing_module() {
+    let r = run("use No.Such.Module\nmain = println \"hi\"");
+    assert!(r.is_err());
+    let msg = r.unwrap_err().into_iter().map(|d| d.message).collect::<Vec<_>>().join("; ");
+    assert!(msg.contains("not found"), "got: {msg}");
 }
