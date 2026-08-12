@@ -82,17 +82,6 @@ impl Ty {
         Ty::Con(TyCon::List, vec![elem])
     }
 
-    pub fn is_copy(&self) -> bool {
-        matches!(
-            self,
-            Ty::Con(TyCon::Int, _)
-                | Ty::Con(TyCon::Float, _)
-                | Ty::Con(TyCon::Bool, _)
-                | Ty::Con(TyCon::Char, _)
-                | Ty::Con(TyCon::Ref, _)
-                | Ty::Con(TyCon::Func, _)
-        )
-    }
 }
 
 fn tyvar_name(id: u32) -> String {
