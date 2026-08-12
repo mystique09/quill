@@ -12,6 +12,7 @@ use crate::parser;
 pub struct Loader {
     search_paths: Vec<PathBuf>,
     embedded: HashMap<String, &'static str>,
+    include_prelude: bool,
 }
 
 struct LoadedModule {
@@ -49,7 +50,16 @@ impl Loader {
         Loader {
             search_paths: vec![PathBuf::from(".")],
             embedded,
+            include_prelude: true,
         }
+    }
+
+    /// A loader that does not auto-import the standard prelude (used by the
+    /// native compiler while it catches up with the full language).
+    pub fn without_prelude() -> Self {
+        let mut l = Self::new();
+        l.include_prelude = false;
+        l
     }
 
     pub fn add_search_path(&mut self, path: PathBuf) {
@@ -63,16 +73,18 @@ impl Loader {
         let mut visiting = HashSet::new();
         let mut visited = HashSet::new();
         // Load the implicit prelude module.
-        if let Ok(prelude_src) = self.resolve("Std.List", Span::default()) {
-            self.load_module(
-                "Std.List".to_string(),
-                &prelude_src,
-                false,
-                &mut loaded,
-                &mut visiting,
-                &mut visited,
-                &mut errors,
-            );
+        if self.include_prelude {
+            if let Ok(prelude_src) = self.resolve("Std.List", Span::default()) {
+                self.load_module(
+                    "Std.List".to_string(),
+                    &prelude_src,
+                    false,
+                    &mut loaded,
+                    &mut visiting,
+                    &mut visited,
+                    &mut errors,
+                );
+            }
         }
         self.load_module(
             "Main".to_string(),
@@ -101,6 +113,7 @@ impl Loader {
         let mut loader = Loader {
             search_paths: self.search_paths.clone(),
             embedded: self.embedded.clone(),
+            include_prelude: self.include_prelude,
         };
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty() {
