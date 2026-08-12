@@ -1,11 +1,15 @@
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use quill::error::render;
 use quill::{run, run_file};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "build" {
+        build(&args);
+        return;
+    }
     if args.len() > 1 {
         let path = Path::new(&args[1]);
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
@@ -26,6 +30,55 @@ fn main() {
         }
     } else {
         repl();
+    }
+}
+
+/// `quill build file.q` — compile to a native executable.
+fn build(args: &[String]) {
+    let src_path = args.get(2).map(Path::new).unwrap_or_else(|| {
+        eprintln!("usage: quill build <file.q> [output]");
+        std::process::exit(1);
+    });
+    let out_path: PathBuf = match args.get(3) {
+        Some(p) => PathBuf::from(p),
+        None => Path::new(src_path).with_extension(""),
+    };    let src = std::fs::read_to_string(src_path).unwrap_or_else(|e| {
+        eprintln!("error: could not read `{}`: {e}", src_path.display());
+        std::process::exit(1);
+    });
+    match quill::compile_file(src_path) {
+        Ok(object) => {
+            let obj_path = out_path.with_extension("o");
+            if let Err(e) = std::fs::write(&obj_path, &object) {
+                eprintln!("error: could not write `{}`: {e}", obj_path.display());
+                std::process::exit(1);
+            }
+            let status = std::process::Command::new("cc")
+                .arg(&obj_path)
+                .arg("-o")
+                .arg(&out_path)
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    let _ = std::fs::remove_file(&obj_path);
+                    println!("built {}", out_path.display());
+                }
+                Ok(s) => {
+                    eprintln!("error: linker exited with {s}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: could not invoke `cc` to link: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(diags) => {
+            for d in &diags {
+                eprint!("{}", render(&src, d));
+            }
+            std::process::exit(1);
+        }
     }
 }
 
