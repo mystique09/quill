@@ -10,13 +10,16 @@ that make Rust great:
   algebraic data types, polymorphism, and type classes.
 - **Algebraic data types & pattern matching** — Rust's `enum`s, Haskell's `data`.
 - **Traits (type classes)** — `class` / `instance`, with overloaded operators.
-- **Ownership** — values *move* by default, `clone` duplicates, `&` / `&mut`
-  borrow, and mutation requires `mut`.
-- **Immutability by default** — like Rust, bindings are immutable unless declared `mut`.
-- **No `null`** — use `Option` and `Result`-style ADTs instead.
+- **A module system** — multi-file programs with `use`, qualified imports, and
+  export lists.
+- **A standard library written in Quill itself** — `Std.List`, `Std.Option`,
+  `Std.Result`, `Std.Function`.
+- **Immutability by default** — like Rust, bindings are immutable unless declared `mut`,
+  with `&`/`&mut` borrows. Memory is managed by automatic reference counting.
+- **No `null`** — use `Option` and `Result` instead.
 
-Quill is a tree-walking interpreter. It lexes, parses, type-checks, borrow-checks,
-and then evaluates your program.
+Quill is a tree-walking interpreter. It lexes, parses, type-checks, and then
+evaluates your program.
 
 ## Quick start
 
@@ -43,41 +46,28 @@ fib n
 
 -- Algebraic data types (Rust enums).
 data Option a = None | Some a
-data List a   = Nil | Cons a (List a)
-
-length :: List a -> Int
-length Nil        = 0
-length (Cons _ t) = 1 + length t
 
 -- Records (Rust structs).
 data Person = Person { name :: String, age :: Int }
-
-greet :: Person -> String
-greet p = "Hi " ++ p.name
 
 -- Traits / type classes.
 class Area a where
   area :: a -> Float
 
-instance Area Shape where
-  area (Circle r) = 3.14159 * r * r
+-- Modules: import the standard library (written in Quill itself).
+use Std.Option as O
 
--- Ownership: moves, clones, borrows, and mutation.
-main = let s = "owned"
-           t = clone s      -- explicit copy
-           r = &s           -- borrow
-           mut n = 0        -- mutable binding
-       in n := n + 1
+-- Immutability by default; `mut` for mutation.
+main = let mut n = 0 in let _ = n := n + 1 in println (show (O.fromMaybe 0 (O.Some 41) + n))
 ```
 
 Run the examples:
 
 ```console
+$ cargo run -- examples/hello.q
 $ cargo run -- examples/recursion.q
-$ cargo run -- examples/adt.q
-$ cargo run -- examples/typeclass.q
-$ cargo run -- examples/records.q
-$ cargo run -- examples/ownership.q
+$ cargo run -- examples/stdlib.q
+$ cargo run -- examples/modules/Main.q    # multi-file program
 ```
 
 See [docs/LANGUAGE.md](docs/LANGUAGE.md) for the full language reference.
@@ -91,9 +81,11 @@ See [docs/LANGUAGE.md](docs/LANGUAGE.md) for the full language reference.
 | `src/ast.rs`      | Syntax tree definitions |
 | `src/types.rs`    | Type representation |
 | `src/infer.rs`    | Hindley–Milner type inference + type classes |
-| `src/ownership.rs`| Move / mutability / borrow checker |
+| `src/modules.rs`  | Module loader (imports, export lists, name resolution) |
+| `src/ownership.rs`| Mutability checker |
 | `src/eval.rs`     | Tree-walking interpreter |
 | `src/error.rs`    | rustc-style diagnostics |
+| `stdlib/`         | The standard library, written in Quill |
 
 ## Status
 

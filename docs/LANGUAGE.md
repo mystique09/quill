@@ -104,8 +104,32 @@ instance Eq Int where
 ```
 
 Single-parameter classes only. Method dispatch happens at the type of the first
-argument. The standard library predefines `Num`, `Eq`, `Ord`, `Show`, and
-`Append`, with instances for the built-in types.
+argument. The standard library predefines `Num` and `Append` (for arithmetic
+operators and `++`, with instances for the built-in types).
+
+## Modules
+
+Quill programs can span multiple files.
+
+- `use Shapes` imports all of `Shapes`'s exports unqualified.
+- `use Shapes as S` imports them qualified: `S.area`, `S.Circle`.
+- `module Shapes (Shape, Circle, area) where` declares a module and its export
+  list. Listing a data type exports its constructors too.
+
+`use` resolves a module by replacing `.` with `/` and appending `.q`, looking in
+the current directory (or the importing file's directory for a file program).
+The standard library modules — `Std.List`, `Std.Option`, `Std.Result`,
+`Std.Function` — are embedded in the interpreter and need no files on disk.
+
+`Std.List` is the *implicit prelude*: its exports (`map`, `filter`, `foldl`,
+`foldr`, `head`, `tail`, `length`, `reverse`, `sum`, …) are available
+unqualified in every program.
+
+```haskell
+use Std.Option as O
+
+main = println (show (O.fromMaybe 0 (O.Some 41) + 1))
+```
 
 ## Expressions
 
@@ -123,18 +147,15 @@ argument. The standard library predefines `Num`, `Eq`, `Ord`, `Show`, and
 
 - **Immutability by default.** Bindings are immutable; declare `mut` to allow
   assignment with `:=`.
-- **Moves.** Non-`Copy` values (strings, lists, ADTs, tuples) move on use.
-  Using a moved value is a compile-time error:
+- **Values are shareable.** Immutable values may be used any number of times;
+  memory is managed by automatic reference counting (a cycle collector is
+  planned). This keeps functional code — like `filter` — natural:
 
   ```haskell
-  let s = "hello"
-      t = s     -- moves s; s is now dead
-  in println s  -- error: use of moved value `s`
+  filter p (x:xs) = if p x then x : filter p xs else filter p xs
   ```
 
-- **Copy types.** `Int`, `Float`, `Bool`, `Char`, functions, and `&T`
-  references copy freely.
-- **`clone e`** makes an explicit deep copy.
+- **`clone e`** makes an explicit deep copy (rarely needed now, but available).
 - **Borrows.** `&e` borrows immutably, `&mut e` borrows mutably (requires a
   `mut` binding). Dereference with `*r`.
 - **Assignment.** `x := e` requires `x` to be declared `mut`.
@@ -147,9 +168,13 @@ main = let mut total = 0
 
 ## The prelude
 
-`+ - * / % negate`, `== /= < <= > >=`, `&& || not`, `:`, `++`,
-`head tail length`, `map filter foldl foldr`, `show println error sqrt`,
-`otherwise`.
+The primitive builtins: `+ - * / % negate`, `== /= < <= > >=`, `&& || not`,
+`:`, `++`, `show println error sqrt`, `otherwise`.
+
+`==`, `<`, and `show` are structural and work on any value; `+` requires the
+`Num` class and `++` the `Append` class. The list functions (`map`, `filter`,
+`foldl`, `foldr`, `head`, `tail`, `length`, `reverse`, `sum`, …) are ordinary
+Quill code in `Std.List`, which is imported implicitly.
 
 ## `main`
 
@@ -159,8 +184,8 @@ non-unit value, that value is printed. `println` writes directly to stdout.
 ## Known simplifications
 
 - `let` and `where` are non-recursive (top-level functions *are* recursive).
-- Borrow checking is lexical and conservative; aliasing rules are best-effort.
+- Memory management is reference counting without cycle collection (yet).
 - Type classes are single-parameter and use dynamic dispatch on the first
   argument's runtime type.
-- No `do`-notation, list comprehensions, operator sections, or modules.
+- No `do`-notation, list comprehensions, or operator sections.
 - Records are not open for extension; there is no record update syntax.
