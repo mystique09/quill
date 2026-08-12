@@ -165,3 +165,101 @@ fn native_compile() {
     assert!(has_symbol, "object missing `q_factorial` symbol");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn native_compile_adts() {
+    // The native backend also compiles ADTs, `case`, and Bool patterns to
+    // object code without errors.
+    let dir = std::env::temp_dir().join("quill_native_adt_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("adt.q");
+    std::fs::write(
+        &path,
+        "data Option a = None | Some a\n\
+         unwrap (Some x) = x\n\
+         unwrap None = 0\n\
+         flag True = 10\n\
+         flag False = 20\n\
+         main = unwrap (Some 42) + flag True\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_compile_lists() {
+    // List literals, cons, append, and list patterns compile to object code.
+    let dir = std::env::temp_dir().join("quill_native_list_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("list.q");
+    std::fs::write(
+        &path,
+        "sum [] = 0\n\
+         sum (x:xs) = x + sum xs\n\
+         len [] = 0\n\
+         len (x:xs) = 1 + len xs\n\
+         main = sum ([1, 2] ++ [3, 4]) + len [5]\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_compile_closures() {
+    // Lambdas, higher-order functions, and partial application compile.
+    let dir = std::env::temp_dir().join("quill_native_closure_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("closure.q");
+    std::fs::write(
+        &path,
+        "add x y = x + y\n\
+         inc = add 1\n\
+         map f [] = []\n\
+         map f (x:xs) = f x : map f xs\n\
+         sum [] = 0\n\
+         sum (x:xs) = x + sum xs\n\
+         main = sum (map inc [1, 2]) + sum (map (\\x -> x * 2) [3])\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_compile_capturing_closures() {
+    // Lambdas that capture enclosing variables (closure conversion) compile.
+    let dir = std::env::temp_dir().join("quill_native_capture_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("capture.q");
+    std::fs::write(
+        &path,
+        "makeAdder n = \\x -> x + n\n\
+         apply2 f x y = f x y\n\
+         main = (makeAdder 10) 5 + apply2 (\\x -> \\y -> x + y) 3 4 + (let z = 7 in (\\w -> w + z) 1)\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_compile_strings() {
+    // String literals, `++`, and `println` compile to object code.
+    let dir = std::env::temp_dir().join("quill_native_str_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("str.q");
+    std::fs::write(
+        &path,
+        "greet name = \"Hello, \" ++ name ++ \"!\"\nmain = println (greet \"Ada\")\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
