@@ -28,7 +28,8 @@ native executable.
 $ cargo run -- examples/hello.q
 Hello, world!
 
-$ cargo run -- build examples/recursion.q quill-fact   # native binary
+$ cargo run -- build examples/native.q quill-native   # native binary
+$ ./quill-native                                      # exit code 123
 $ cargo run              # start the REPL
 ```
 

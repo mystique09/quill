@@ -184,10 +184,19 @@ non-unit value, that value is printed. `println` writes directly to stdout.
 ## Compiling to native code
 
 `quill build file.q [output]` compiles a program to a native executable using
-Cranelift. The compiler currently supports `Int`, `Bool`, arithmetic and
-comparison, `if`, top-level function calls (uncurried), recursion, and `Int`
-pattern matching. The compiled `main` returns its result as the process exit
-code. ADTs, lists, closures, strings, and the standard library are coming.
+Cranelift. The compiler supports `Int`, `Bool`, arithmetic and comparison, `if`,
+`case` expressions, top-level function calls (uncurried), recursion, pattern
+matching over `Int`, `Bool`, and algebraic data types (including nested and
+wildcard patterns), `String` literals with `++` and `println`, lists (list
+literals, `:` cons, `++` append, and list patterns), `let`/`where` local
+bindings, lambdas (including those that capture enclosing variables), higher-
+order functions, and partial application. The compiled `main` returns its
+result as the process exit code.
+
+Still to come: tuples, floats, records, `show`, type classes, and the standard
+library. Values are uniformly boxed (every value is a reference-counted heap
+object), so polymorphic functions compile soundly, and releasing an object
+recursively releases its fields.
 
 ## Known simplifications
 
