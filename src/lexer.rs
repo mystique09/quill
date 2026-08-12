@@ -335,10 +335,6 @@ impl<'a> Lexer<'a> {
                         self.bump();
                         TokKind::Backslash
                     }
-                    '|' => {
-                        self.bump();
-                        TokKind::Pipe
-                    }
                     '{' => {
                         self.bump();
                         TokKind::LBrace
@@ -379,10 +375,6 @@ impl<'a> Lexer<'a> {
                         self.bump();
                         TokKind::At
                     }
-                    '&' => {
-                        self.bump();
-                        TokKind::Amp
-                    }
                     c if is_symbol_char(c) => {
                         let mut s = String::new();
                         while let Some(b) = self.peek() {
@@ -396,6 +388,10 @@ impl<'a> Lexer<'a> {
                         }
                         if s == "=" {
                             TokKind::Eq
+                        } else if s == "|" {
+                            TokKind::Pipe
+                        } else if s == "&" {
+                            TokKind::Amp
                         } else {
                             TokKind::Op(s)
                         }
@@ -510,7 +506,7 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 fn is_symbol_char(c: char) -> bool {
-    "!#$%*+./<=>?@\\^|-~:".contains(c)
+    "!#$%&*+./<=>?@\\^|-~:".contains(c)
 }
 
 /// Convert the raw token stream into one with explicit `{`, `}`, `;`,

@@ -79,6 +79,7 @@ impl Parser {
 
     fn parse_program(&mut self) -> PResult<Program> {
         let mut module = None;
+        let mut module_exports = None;
         let mut items = Vec::new();
         while !self.at(&TokKind::Eof) {
             if self.eat(&TokKind::Semi) {
@@ -93,16 +94,49 @@ impl Parser {
             match self.peek().clone() {
                 TokKind::Module => {
                     self.advance();
-                    let (name, _) = self.conid()?;
+                    let mut name = String::new();
+                    loop {
+                        let (part, _) = self.conid()?;
+                        name.push_str(&part);
+                        if self.eat(&TokKind::Dot) {
+                            name.push('.');
+                        } else {
+                            break;
+                        }
+                    }
+                    // Optional export list `(a, b, c)`.
+                    let mut exports = None;
+                    if self.eat(&TokKind::LParen) {
+                        let mut list = Vec::new();
+                        loop {
+                            match self.peek().clone() {
+                                TokKind::Ident(s) | TokKind::ConId(s) => {
+                                    self.advance();
+                                    list.push(s);
+                                }
+                                _ => break,
+                            }
+                            if !self.eat(&TokKind::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&TokKind::RParen, "`)`")?;
+                        exports = Some(list);
+                    }
                     if self.eat(&TokKind::Where) {
                         // `module Foo where` — block handled by layout tokens.
                     }
                     module = Some(name);
+                    module_exports = exports;
                 }
                 TokKind::Use => {
                     self.advance();
                     let mut path = String::new();
                     loop {
+                        // Stop before the `as` alias keyword.
+                        if matches!(self.peek(), TokKind::Ident(s) if s == "as") {
+                            break;
+                        }
                         match self.peek().clone() {
                             TokKind::Ident(s) | TokKind::ConId(s) => {
                                 self.advance();
@@ -116,8 +150,17 @@ impl Parser {
                             break;
                         }
                     }
+                    // Optional alias `as X`.
+                    let mut alias = None;
+                    if let TokKind::Ident(s) = self.peek().clone()
+                        && s == "as" {
+                            self.advance();
+                            let (a, _) = self.conid()?;
+                            alias = Some(a);
+                        }
                     items.push(Item::Use {
                         path,
+                        alias,
                         span: self.span(),
                     });
                 }
@@ -142,7 +185,11 @@ impl Parser {
                 }
             }
         }
-        Ok(Program { module, items })
+        Ok(Program {
+            module,
+            exports: module_exports,
+            items,
+        })
     }
 
     fn parse_type_alias(&mut self) -> PResult<Item> {
@@ -320,20 +367,43 @@ impl Parser {
     }
 
     fn parse_qualified_type(&mut self) -> PResult<(Vec<Type>, Type)> {
+        // A leading `(` is either a constraint list `(Eq a) => ...` or a
+        // parenthesized type `(a -> b) -> ...`. Parse it as a type list and
+        // decide by whether `=>` follows; a parenthesized type may still be
+        // the left side of a function arrow.
         if self.eat(&TokKind::LParen) {
-            let mut constraints = Vec::new();
-            loop {
-                constraints.push(self.parse_btype()?);
-                if !self.eat(&TokKind::Comma) {
-                    self.expect(&TokKind::RParen, "`)`")?;
-                    break;
-                }
+            if self.eat(&TokKind::RParen) {
+                let t = Type::Unit(self.span());
+                return Ok((Vec::new(), self.parse_type_rest(t)?));
             }
-            self.expect(&TokKind::FatArrow, "`=>`")?;
-            let body = self.parse_type()?;
-            return Ok((constraints, body));
+            let mut types = vec![self.parse_type()?];
+            while self.eat(&TokKind::Comma) {
+                types.push(self.parse_type()?);
+            }
+            self.expect(&TokKind::RParen, "`)`")?;
+            if self.eat(&TokKind::FatArrow) {
+                let body = self.parse_type()?;
+                return Ok((types, body));
+            }
+            let t = if types.len() == 1 {
+                types.into_iter().next().unwrap()
+            } else {
+                Type::Tuple(types, self.span())
+            };
+            return Ok((Vec::new(), self.parse_type_rest(t)?));
         }
         Ok((Vec::new(), self.parse_type()?))
+    }
+
+    /// Continue a type that may be the left side of a function arrow.
+    fn parse_type_rest(&mut self, lhs: Type) -> PResult<Type> {
+        if self.eat(&TokKind::Arrow) {
+            let rhs = self.parse_type()?;
+            let span = lhs.span().merge(rhs.span());
+            Ok(Type::Func(Box::new(lhs), Box::new(rhs), span))
+        } else {
+            Ok(lhs)
+        }
     }
 
     // ===================== Functions =====================
@@ -925,6 +995,22 @@ impl Parser {
                         fields,
                         span,
                     });
+                }
+                // Qualified module access `Alias.member`.
+                if self.eat(&TokKind::Dot) {
+                    match self.peek().clone() {
+                        TokKind::Ident(m) | TokKind::ConId(m) => {
+                            self.advance();
+                            let span = start.merge(self.span());
+                            return Ok(Expr::Qualified(name, m, span));
+                        }
+                        other => {
+                            return Err(self.err_here(format!(
+                                "expected a member name after `{name}.`, found {}",
+                                other.describe()
+                            )));
+                        }
+                    }
                 }
                 Ok(Expr::Ctor(name, start))
             }

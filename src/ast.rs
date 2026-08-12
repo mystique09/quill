@@ -5,6 +5,7 @@ use crate::error::Span;
 #[derive(Debug, Clone)]
 pub struct Program {
     pub module: Option<String>,
+    pub exports: Option<Vec<String>>,
     pub items: Vec<Item>,
 }
 
@@ -12,6 +13,7 @@ pub struct Program {
 pub enum Item {
     Use {
         path: String,
+        alias: Option<String>,
         span: Span,
     },
     TypeAlias {
@@ -203,6 +205,8 @@ pub enum Expr {
     Clone(Box<Expr>, Span),
     /// `e.field` record projection.
     Field(Box<Expr>, String, Span),
+    /// Qualified module access `Alias.member`.
+    Qualified(String, String, Span),
     /// `Name { field = expr, ... }` record construction.
     Record {
         ctor: String,
@@ -235,6 +239,7 @@ impl Expr {
             | Expr::Deref(_, s)
             | Expr::Clone(_, s)
             | Expr::Field(_, _, s)
+            | Expr::Qualified(_, _, s)
             | Expr::Ascribe(_, _, s)
             | Expr::Record { span: s, .. } => *s,
         }
