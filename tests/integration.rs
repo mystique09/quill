@@ -936,3 +936,118 @@ fn native_readline_error_traps() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn repeat_negative_terminates() {
+    // `repeat` with a negative count returns the empty string instead of
+    // diverging (both engines; the native half is
+    // native_builtins_as_values).
+    let src = r#"
+use Std.String as S
+main = println (show (S.repeat "ab" (-1)) ++ "|" ++ S.repeat "x" 3)
+"#;
+    assert_eq!(run_ok(src), "|xxx\n");
+}
+
+/// Builtins work as first-class values (`map ord ...`), `sqrt` compiles,
+/// and `repeat` handles negative counts — link-and-run; skipped without a C
+/// compiler.
+#[test]
+fn native_builtins_as_values() {
+    let dir = std::env::temp_dir().join("quill_native_bv_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bv.q");
+    std::fs::write(
+        &path,
+        "use Std.String as S\n\
+         main = let _ = println (show (map ord ['A', 'B'])) in\n\
+         \x20\x20\x20\x20\x20\x20\x20let _ = println (show (sqrt 9.0)) in\n\
+         \x20\x20\x20\x20\x20\x20\x20println (show (S.repeat \"ab\" (-1)) ++ \"|\" ++ S.repeat \"x\" 3)\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("bv.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("bv");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[65, 66]\n3.0\n|xxx\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compiled readLine rejects invalid UTF-8 by trapping, like the
+/// interpreter's read_line error (a valid line still round-trips). Skipped
+/// without a C compiler.
+#[test]
+fn native_readline_invalid_utf8_traps() {
+    let dir = std::env::temp_dir().join("quill_native_badutf8_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bad.q");
+    std::fs::write(
+        &path,
+        "use Std.IO as IO\n\
+         use Std.Option\n\
+         main = println (case IO.readLine () of { None -> \"eof\"; Some l -> l })\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("bad.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("bad");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    // Invalid UTF-8 on stdin must trap…
+    let mut child = std::process::Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"\xff\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "expected invalid UTF-8 to trap, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // …while a valid line round-trips.
+    let mut child2 = std::process::Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child2.stdin.as_mut().unwrap(), b"h\xc3\xa9\n").unwrap();
+    let output2 = child2.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output2.stdout), "hé\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
