@@ -59,7 +59,13 @@ enum Builtin {
     Error,
     Sqrt,
     Chr,
+    Ord,
+    Floor,
+    Ceil,
     Snoc,
+    /// Internal for `Std.IO`: reads one line of stdin, boxing it as
+    /// `Std.Option` (`None` at end of input).
+    ReadLine,
 }
 
 impl Builtin {
@@ -777,6 +783,39 @@ impl<'a> Eval<'a> {
                 }
                 _ => Err(rt_err("`chr` expects an Int", span)),
             },
+            // `ord` is `chr`'s inverse: the code point of a Char as an Int.
+            Builtin::Ord => match &args[0] {
+                Value::Char(c) => Ok(Value::Int(*c as u32 as i64)),
+                _ => Err(rt_err("`ord` expects a Char", span)),
+            },
+            // Float rounding to Int. Ints pass through unchanged, like `sqrt`
+            // accepts Ints.
+            Builtin::Floor | Builtin::Ceil => match &args[0] {
+                Value::Float(x) => {
+                    let r = match b {
+                        Builtin::Floor => x.floor(),
+                        _ => x.ceil(),
+                    };
+                    Ok(Value::Int(r as i64))
+                }
+                Value::Int(x) => Ok(Value::Int(*x)),
+                _ => Err(rt_err("rounding builtin expects a number", span)),
+            },
+            // One line of stdin as `Std.Option` (`None` at end of input);
+            // the trailing newline/CR is stripped.
+            Builtin::ReadLine => {
+                let mut line = String::new();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) => self.option_value("Std.Option.None", None, span),
+                    Ok(_) => {
+                        while line.ends_with('\n') || line.ends_with('\r') {
+                            line.pop();
+                        }
+                        self.option_value("Std.Option.Some", Some(Value::Str(line)), span)
+                    }
+                    Err(e) => Err(rt_err(format!("readLine: {e}"), span)),
+                }
+            }
             Builtin::Snoc => match (&args[0], &args[1]) {
                 (Value::Str(s), Value::Char(c)) => {
                     let mut out = s.clone();
@@ -786,6 +825,31 @@ impl<'a> Eval<'a> {
                 _ => Err(rt_err("`snoc` expects a String and a Char", span)),
             },
         }
+    }
+
+    /// Construct a stdlib `Std.Option` value (`None`, or `Some payload`).
+    /// The constructors live in `Std.Option`, so the module must be loaded —
+    /// which it always is when `Std.IO` is, since `Std.IO` imports it.
+    fn option_value(
+        &self,
+        ctor: &str,
+        payload: Option<Value>,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let &(adt_id, ctor_idx) = self
+            .info
+            .ctor_by_name
+            .get(ctor)
+            .ok_or_else(|| rt_err("`Std.Option` is not loaded", span))?;
+        let adt = &self.info.adts[adt_id];
+        let cr = &adt.ctors[ctor_idx];
+        Ok(Value::Adt {
+            adt_id,
+            name: adt.name.clone(),
+            ctor: cr.name.clone(),
+            fields: payload.into_iter().collect(),
+            record: vec![],
+        })
     }
 
     fn apply_func(&self, fv: FuncVal, arg: Value, span: Span) -> Result<Value, Diagnostic> {
@@ -1096,7 +1160,13 @@ fn install_prelude(global: &mut Scope, info: &ProgramInfo) {
         ("error", Builtin::Error),
         ("sqrt", Builtin::Sqrt),
         ("chr", Builtin::Chr),
+        ("ord", Builtin::Ord),
+        ("floor", Builtin::Floor),
+        ("ceil", Builtin::Ceil),
         ("snoc", Builtin::Snoc),
+        // Internal support for `Std.IO`; typed `() -> a` so `Std.IO` can
+        // give it the concrete `() -> Option String` signature.
+        ("_readLine", Builtin::ReadLine),
     ];
     for (name, b) in builtins {
         global.insert(

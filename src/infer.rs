@@ -712,7 +712,14 @@ impl Infer {
         prelude.push(("print".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::unit()) }));
         prelude.push(("sqrt".into(), Scheme::mono(Ty::func(Ty::float(), Ty::float()))));
         prelude.push(("chr".into(), Scheme::mono(Ty::func(Ty::int(), Ty::char()))));
+        prelude.push(("ord".into(), Scheme::mono(Ty::func(Ty::char(), Ty::int()))));
+        prelude.push(("floor".into(), Scheme::mono(Ty::func(Ty::float(), Ty::int()))));
+        prelude.push(("ceil".into(), Scheme::mono(Ty::func(Ty::float(), Ty::int()))));
         prelude.push(("snoc".into(), Scheme::mono(Ty::func(Ty::string(), Ty::func(Ty::char(), Ty::string())))));
+        let a = self.new_var();
+        // Native support for `Std.IO.readLine`; the module gives it the
+        // concrete `() -> Option String` type via its own signature.
+        prelude.push(("_readLine".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::unit(), Ty::Var(a)) }));
         let a = self.new_var();
         prelude.push(("error".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::string(), Ty::Var(a)) }));
         prelude.push(("otherwise".into(), Scheme::mono(Ty::bool())));
