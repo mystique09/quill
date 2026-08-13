@@ -274,28 +274,47 @@ impl Compiler {
 
         // Collect every lambda (with its captured variables), assign it a
         // generated name, and declare it.
-        let mut raw_lambdas: Vec<(usize, Vec<Pattern>, Box<Expr>, crate::error::Span)> =
-            Vec::new();
+        let mut raw_lambdas: Vec<(
+            usize,
+            Vec<Pattern>,
+            Box<Expr>,
+            crate::error::Span,
+            std::collections::HashSet<String>,
+        )> = Vec::new();
         for item in &program.items {
             if let Item::Function(f) = item {
                 for clause in &f.clauses {
-                    collect_lambdas(&clause.body, &mut raw_lambdas);
+                    let mut bound: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for p in &clause.pats {
+                        pat_vars(p, &mut bound);
+                    }
+                    collect_lambdas(&clause.body, &mut bound, &mut raw_lambdas);
                 }
             }
         }
         let mut lambda_fns: Vec<(Function, Vec<String>, std::collections::HashSet<String>)> =
             Vec::new();
-        for (i, (span_lo, params, body, span)) in raw_lambdas.iter().enumerate() {
-            let name = format!("q_lambda_{i}");
+        for (i, (span_lo, params, body, span, enclosing)) in raw_lambdas.iter().enumerate() {
+            let name = format!("$lambda_{i}");
             // Captured variables are the free variables that resolve to the
-            // enclosing scope's locals — i.e. not builtins, constructors, or
-            // top-level functions (those resolve statically).
+            // enclosing scope's locals. Names bound anywhere between the
+            // lambda and the top level — including locals that shadow a
+            // builtin, like `let ord = ...` — are captured; only names that
+            // resolve statically (builtins, constructors, top-level
+            // functions) are not.
             let free_vars: Vec<String> = lambda_free_vars(params, body)
                 .into_iter()
                 .filter(|n| {
-                    !is_builtin(n)
-                        && self.info.ctor_of(n).is_none()
-                        && !self.arities.contains_key(n)
+                    // A name bound between the lambda and the top level —
+                    // including a local that shadows a builtin, like
+                    // `let ord = ...` — is captured. Otherwise, only names
+                    // that do NOT resolve statically (builtins,
+                    // constructors, top-level functions) are captured.
+                    enclosing.contains(n)
+                        || (!is_builtin(n)
+                            && self.info.ctor_of(n).is_none()
+                            && !self.arities.contains_key(n))
                 })
                 .collect();
             // Captured variables the body mutates must be cells so the
@@ -347,7 +366,7 @@ impl Compiler {
             ("snoc", 2),
         ];
         for (i, (bname, arity)) in builtins.iter().enumerate() {
-            let fname = format!("q_builtin_{i}");
+            let fname = format!("$builtin_{i}");
             let pats: Vec<Pattern> = (0..*arity)
                 .map(|k| Pattern::Var(format!("$b{k}"), crate::error::Span::default()))
                 .collect();
@@ -451,7 +470,7 @@ impl Compiler {
                 });
             }
             for (k, (mname, clauses)) in clauses_by_name.into_iter().enumerate() {
-                let name = format!("q_inst_{inst_count}_{k}");
+                let name = format!("$inst_{inst_count}_{k}");
                 let arity = clauses.first().map(|c| c.pats.len()).unwrap_or(0);
                 let free_vars: Vec<String> = clauses
                     .iter()
@@ -497,21 +516,33 @@ impl Compiler {
 
             // Nested lambdas inside the instance's method bodies are compiled
             // like top-level lambdas (own function, captured free variables).
-            let mut raw_inst_lambdas: Vec<(usize, Vec<Pattern>, Box<Expr>, crate::error::Span)> =
-                Vec::new();
+            let mut raw_inst_lambdas: Vec<(
+                usize,
+                Vec<Pattern>,
+                Box<Expr>,
+                crate::error::Span,
+                std::collections::HashSet<String>,
+            )> = Vec::new();
             for (f, _, _) in &inst_fns {
                 for c in &f.clauses {
-                    collect_lambdas(&c.body, &mut raw_inst_lambdas);
+                    let mut bound: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for p in &c.pats {
+                        pat_vars(p, &mut bound);
+                    }
+                    collect_lambdas(&c.body, &mut bound, &mut raw_inst_lambdas);
                 }
             }
-            for (i, (span_lo, params, body, span)) in raw_inst_lambdas.iter().enumerate() {
-                let name = format!("q_instlam_{inst_count}_{i}");
+            for (i, (span_lo, params, body, span, enclosing)) in raw_inst_lambdas.iter().enumerate()
+            {
+                let name = format!("$instlam_{inst_count}_{i}");
                 let free_vars: Vec<String> = lambda_free_vars(params, body)
                     .into_iter()
                     .filter(|n| {
-                        !is_builtin(n)
-                            && self.info.ctor_of(n).is_none()
-                            && !self.arities.contains_key(n)
+                        enclosing.contains(n)
+                            || (!is_builtin(n)
+                                && self.info.ctor_of(n).is_none()
+                                && !self.arities.contains_key(n))
                     })
                     .collect();
                 let assigned = assigned_names(body);
@@ -4446,47 +4477,66 @@ fn build_args_list(bcx: &mut FunctionBuilder, arg_vals: &[Value], rt: Rt) -> Val
 /// ones), as `(span.lo, params, body, span)`.
 fn collect_lambdas(
     expr: &Expr,
-    out: &mut Vec<(usize, Vec<Pattern>, Box<Expr>, crate::error::Span)>,
+    bound: &mut std::collections::HashSet<String>,
+    out: &mut Vec<(
+        usize,
+        Vec<Pattern>,
+        Box<Expr>,
+        crate::error::Span,
+        std::collections::HashSet<String>,
+    )>,
 ) {
     match expr {
         Expr::Lambda(params, body, span) => {
-            out.push((span.lo, params.clone(), body.clone(), *span));
-            collect_lambdas(body, out);
+            out.push((span.lo, params.clone(), body.clone(), *span, bound.clone()));
+            let mut nb = bound.clone();
+            for p in params {
+                pat_vars(p, &mut nb);
+            }
+            collect_lambdas(body, &mut nb, out);
         }
         Expr::App(f, a, _) => {
-            collect_lambdas(f, out);
-            collect_lambdas(a, out);
+            collect_lambdas(f, bound, out);
+            collect_lambdas(a, bound, out);
         }
         Expr::Let(bindings, body, _) => {
             for b in bindings {
-                collect_lambdas(&b.expr, out);
+                collect_lambdas(&b.expr, bound, out);
             }
-            collect_lambdas(body, out);
+            let mut nb = bound.clone();
+            for b in bindings {
+                if let Some(n) = b.name() {
+                    nb.insert(n.to_string());
+                }
+            }
+            collect_lambdas(body, &mut nb, out);
         }
         Expr::If(c, t, e, _) => {
-            collect_lambdas(c, out);
-            collect_lambdas(t, out);
-            collect_lambdas(e, out);
+            collect_lambdas(c, bound, out);
+            collect_lambdas(t, bound, out);
+            collect_lambdas(e, bound, out);
         }
         Expr::Case(s, alts, _) => {
-            collect_lambdas(s, out);
+            collect_lambdas(s, bound, out);
             for alt in alts {
-                collect_lambdas(&alt.body, out);
+                let mut nb = bound.clone();
+                pat_vars(&alt.pat, &mut nb);
+                collect_lambdas(&alt.body, &mut nb, out);
             }
         }
-        Expr::Ascribe(e, _, _) => collect_lambdas(e, out),
+        Expr::Ascribe(e, _, _) => collect_lambdas(e, bound, out),
         Expr::Tuple(es, _) | Expr::List(es, _) => {
             for e in es {
-                collect_lambdas(e, out);
+                collect_lambdas(e, bound, out);
             }
         }
         Expr::Borrow { expr, .. }
         | Expr::Deref(expr, _)
         | Expr::Clone(expr, _)
-        | Expr::Field(expr, _, _) => collect_lambdas(expr, out),
+        | Expr::Field(expr, _, _) => collect_lambdas(expr, bound, out),
         Expr::Record { fields, .. } => {
             for (_, e) in fields {
-                collect_lambdas(e, out);
+                collect_lambdas(e, bound, out);
             }
         }
         _ => {}

@@ -1086,3 +1086,86 @@ fn native_println_nul() {
     assert_eq!(output.stdout, b"a\0b\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A nested lambda captures a local that shadows a builtin (the lexical
+/// binding wins over the builtin, like the interpreter). Link-and-run;
+/// skipped without a C compiler.
+#[test]
+fn native_captured_builtin_shadowing() {
+    let dir = std::env::temp_dir().join("quill_native_capshadow_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cap.q");
+    std::fs::write(
+        &path,
+        "main = let ord = \\_ -> 42 in let f = \\c -> ord c in println (show (f 'A'))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("cap.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("cap");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Generated function names (`$builtin_N`, `$lambda_N`) cannot collide with
+/// user definitions — `q_builtin_0`/`q_lambda_0` are ordinary user names —
+/// even when builtin wrappers are synthesized. Link-and-run; skipped without
+/// a C compiler.
+#[test]
+fn native_generated_name_collision() {
+    let dir = std::env::temp_dir().join("quill_native_genname_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gen.q");
+    std::fs::write(
+        &path,
+        "q_builtin_0 _ = 42\n\
+         q_lambda_0 x = x + 1\n\
+         main = println (show (q_builtin_0 1) ++ \" \" ++ show (q_lambda_0 1) ++ \" \" ++ show (map ord ['A']))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("gen.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("gen");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42 2 [65]\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
