@@ -169,12 +169,17 @@ main = let mut total = 0
 ## The prelude
 
 The primitive builtins: `+ - * / % negate`, `== /= < <= > >=`, `&& || not`,
-`:`, `++`, `show println error sqrt`, `otherwise`.
+`:`, `++`, `show println error sqrt chr snoc`, `otherwise`.
 
 `==`, `<`, and `show` are structural and work on any value; `+` requires the
 `Num` class and `++` the `Append` class. The list functions (`map`, `filter`,
 `foldl`, `foldr`, `head`, `tail`, `length`, `reverse`, `sum`, …) are ordinary
 Quill code in `Std.List`, which is imported implicitly.
+
+Strings support cons patterns: `(c:cs)` destructures a string into its first
+character and the rest (when the pattern's type is `String`). `chr` maps a
+byte (mod 256) to its `Char`, and `snoc` appends a `Char` to a `String` —
+together they make character-level I/O possible without `do`-notation.
 
 ## `main`
 
@@ -184,19 +189,26 @@ non-unit value, that value is printed. `println` writes directly to stdout.
 ## Compiling to native code
 
 `quill build file.q [output]` compiles a program to a native executable using
-Cranelift. The compiler supports `Int`, `Bool`, arithmetic and comparison, `if`,
-`case` expressions, top-level function calls (uncurried), recursion, pattern
-matching over `Int`, `Bool`, and algebraic data types (including nested and
-wildcard patterns), `String` literals with `++` and `println`, lists (list
-literals, `:` cons, `++` append, and list patterns), `let`/`where` local
-bindings, lambdas (including those that capture enclosing variables), higher-
-order functions, and partial application. The compiled `main` returns its
-result as the process exit code.
+Cranelift. The compiler supports `Int`, `Float`, `Bool`, arithmetic and
+comparison (with tag-dispatched `Int`/`Float`), `if`, `case` expressions,
+top-level function calls (uncurried), recursion, pattern matching over `Int`,
+`Bool`, `Float`, and algebraic data types (including nested, tuple, record,
+and wildcard patterns), `String` literals with `++` and `println`, lists (list
+literals, `:` cons, `++` append, and list patterns), tuples, records
+(construction, projection, and patterns), `let`/`where` local bindings
+(including `mut` bindings and `:=`, implemented with shared cells so closures
+mutate the same storage), lambdas (including those that capture enclosing
+variables), higher-order functions, partial application, structural `show`,
+type classes (method dispatch on the receiver's runtime constructor tag), and
+the standard library (the implicit `Std.List` prelude and `use`d modules are
+compiled into the object). The compiled `main` returns its result as the
+process exit code.
 
-Still to come: tuples, floats, records, `show`, type classes, and the standard
-library. Values are uniformly boxed (every value is a reference-counted heap
-object), so polymorphic functions compile soundly, and releasing an object
-recursively releases its fields.
+Number formatting in `show` is provided by a small C runtime
+(`runtime/quill-rt.c`) compiled and linked by `quill build`. Values are
+uniformly boxed (every value is a reference-counted heap object), so
+polymorphic functions compile soundly, and releasing an object recursively
+releases its fields.
 
 ## Known simplifications
 

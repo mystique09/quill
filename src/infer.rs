@@ -710,6 +710,8 @@ impl Infer {
         let a = self.new_var();
         prelude.push(("println".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::unit()) }));
         prelude.push(("sqrt".into(), Scheme::mono(Ty::func(Ty::float(), Ty::float()))));
+        prelude.push(("chr".into(), Scheme::mono(Ty::func(Ty::int(), Ty::char()))));
+        prelude.push(("snoc".into(), Scheme::mono(Ty::func(Ty::string(), Ty::func(Ty::char(), Ty::string())))));
         let a = self.new_var();
         prelude.push(("error".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::string(), Ty::Var(a)) }));
         prelude.push(("otherwise".into(), Scheme::mono(Ty::bool())));
@@ -964,7 +966,7 @@ impl Infer {
         let mut arg_tys = Vec::new();
         let mut ok = true;
         for (i, p) in clause.pats.iter().enumerate() {
-            match self.infer_pattern(p) {
+            match self.infer_pattern(p, expected.and_then(|e| e.get(i))) {
                 Some(t) => {
                     if let Some(exp) = expected.and_then(|e| e.get(i)) {
                         let _ = self.unify(t.clone(), exp.clone(), p.span());
@@ -989,7 +991,7 @@ impl Infer {
 
     // ==================== Patterns ====================
 
-    fn infer_pattern(&mut self, pat: &Pattern) -> Option<Ty> {
+    fn infer_pattern(&mut self, pat: &Pattern, expected: Option<&Ty>) -> Option<Ty> {
         match pat {
             Pattern::Var(name, span) => {
                 let t = self.fresh_ty();
@@ -1026,7 +1028,7 @@ impl Infer {
                     } else {
                         self.subst_field(&record[0].1, &params, &fresh)
                     };
-                    let apt = self.infer_pattern(ap)?;
+                    let apt = self.infer_pattern(ap, None)?;
                     if let Ok(ft) = field_ty {
                         let _ = self.unify(apt, ft, ap.span());
                     }
@@ -1036,26 +1038,38 @@ impl Infer {
             Pattern::Tuple(ps, _) => {
                 let mut ts = Vec::new();
                 for p in ps {
-                    ts.push(self.infer_pattern(p)?);
+                    ts.push(self.infer_pattern(p, None)?);
                 }
                 Some(Ty::Con(TyCon::Tuple(ps.len()), ts))
             }
             Pattern::List(ps, _) => {
                 let te = self.fresh_ty();
                 for p in ps {
-                    let pt = self.infer_pattern(p)?;
+                    let pt = self.infer_pattern(p, None)?;
                     let _ = self.unify(pt, te.clone(), p.span());
                 }
                 Some(Ty::list(te))
             }
             Pattern::Cons(a, b, _) => {
-                let ta = self.infer_pattern(a)?;
-                let tb = self.infer_pattern(b)?;
-                let _ = self.unify(tb, Ty::list(ta.clone()), b.span());
-                Some(Ty::list(ta))
+                // A cons pattern destructures a list, or — when the expected
+                // type is `String` — a string (head `Char`, tail `String`).
+                if let Some(Ty::Con(TyCon::String, _)) =
+                    expected.map(|e| self.resolve(e.clone()))
+                {
+                    let ta = self.infer_pattern(a, None)?;
+                    let tb = self.infer_pattern(b, None)?;
+                    let _ = self.unify(ta, Ty::char(), a.span());
+                    let _ = self.unify(tb, Ty::string(), b.span());
+                    Some(Ty::string())
+                } else {
+                    let ta = self.infer_pattern(a, None)?;
+                    let tb = self.infer_pattern(b, None)?;
+                    let _ = self.unify(tb, Ty::list(ta.clone()), b.span());
+                    Some(Ty::list(ta))
+                }
             }
             Pattern::As(name, inner, span) => {
-                let t = self.infer_pattern(inner)?;
+                let t = self.infer_pattern(inner, None)?;
                 self.binding_types.insert(span.lo, t.clone());
                 self.insert_local(name, Scheme::mono(t.clone()));
                 Some(t)
@@ -1068,7 +1082,7 @@ impl Infer {
                 for (fname, fp) in fields {
                     if let Some((_, fty)) = record.iter().find(|(n, _)| n == fname) {
                         let ft = self.subst_field(fty, &params, &fresh).ok()?;
-                        let pt = self.infer_pattern(fp)?;
+                        let pt = self.infer_pattern(fp, None)?;
                         let _ = self.unify(pt, ft, fp.span());
                     } else {
                         self.errors.push(Diagnostic::error(
@@ -1119,7 +1133,7 @@ impl Infer {
                 let mut arg_tys = Vec::new();
                 let mut ok = true;
                 for p in pats {
-                    match self.infer_pattern(p) {
+                    match self.infer_pattern(p, None) {
                         Some(t) => arg_tys.push(t),
                         None => ok = false,
                     }
@@ -1162,7 +1176,7 @@ impl Infer {
                 let tr = self.fresh_ty();
                 for alt in alts {
                     self.push_scope();
-                    if let Some(pt) = self.infer_pattern(&alt.pat) {
+                    if let Some(pt) = self.infer_pattern(&alt.pat, None) {
                         let _ = self.unify(ts.clone(), pt, alt.pat.span());
                     }
                     if let Some(bt) = self.infer_expr(&alt.body) {
@@ -1339,7 +1353,7 @@ impl Infer {
                     self.insert_local(name, scheme);
                 }
             } else {
-                if let Some(pt) = self.infer_pattern(pat)
+                if let Some(pt) = self.infer_pattern(pat, None)
                     && let Some(et) = self.infer_expr(&b.expr) {
                         let _ = self.unify(pt, et, b.span);
                     }

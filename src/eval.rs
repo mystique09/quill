@@ -57,6 +57,8 @@ enum Builtin {
     Println,
     Error,
     Sqrt,
+    Chr,
+    Snoc,
 }
 
 impl Builtin {
@@ -76,7 +78,8 @@ impl Builtin {
             | Builtin::And
             | Builtin::Or
             | Builtin::Cons
-            | Builtin::Append => 2,
+            | Builtin::Append
+            | Builtin::Snoc => 2,
             _ => 1,
         }
     }
@@ -756,6 +759,25 @@ impl<'a> Eval<'a> {
                 Value::Int(x) => Ok(Value::Float((*x as f64).sqrt())),
                 _ => Err(rt_err("`sqrt` expects a number", span)),
             },
+            // `chr` maps a byte (mod 256) to a character; `snoc` appends a
+            // character to a string (the cons for strings).
+            Builtin::Chr => match &args[0] {
+                Value::Int(n) => {
+                    let byte = n.rem_euclid(256) as u32;
+                    char::from_u32(byte)
+                        .map(Value::Char)
+                        .ok_or_else(|| rt_err("`chr` produced an invalid character", span))
+                }
+                _ => Err(rt_err("`chr` expects an Int", span)),
+            },
+            Builtin::Snoc => match (&args[0], &args[1]) {
+                (Value::Str(s), Value::Char(c)) => {
+                    let mut out = s.clone();
+                    out.push(*c);
+                    Ok(Value::Str(out))
+                }
+                _ => Err(rt_err("`snoc` expects a String and a Char", span)),
+            },
         }
     }
 
@@ -1003,6 +1025,13 @@ fn match_pattern(pat: &Pattern, value: Value, out: &mut Vec<(String, Value)>) ->
                 let head = vs.remove(0);
                 let tail = Value::List(vs);
                 match_pattern(a, head, out) && match_pattern(b, tail, out)
+            } else if let Value::Str(s) = value {
+                let mut chars = s.chars();
+                let Some(head) = chars.next() else {
+                    return false;
+                };
+                let tail = Value::Str(chars.as_str().to_string());
+                match_pattern(a, Value::Char(head), out) && match_pattern(b, tail, out)
             } else {
                 false
             }
@@ -1058,6 +1087,8 @@ fn install_prelude(global: &mut Scope, info: &ProgramInfo) {
         ("println", Builtin::Println),
         ("error", Builtin::Error),
         ("sqrt", Builtin::Sqrt),
+        ("chr", Builtin::Chr),
+        ("snoc", Builtin::Snoc),
     ];
     for (name, b) in builtins {
         global.insert(
