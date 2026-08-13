@@ -11,19 +11,28 @@ fn main() {
         return;
     }
     if args.len() > 1 {
-        let path = Path::new(&args[1]);
-        let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        let path = PathBuf::from(&args[1]);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             eprintln!("error: could not read `{}`: {e}", path.display());
             std::process::exit(1);
         });
-        match run_file(path) {
+        // Deep recursion (e.g. the Brainfuck example) needs more stack than
+        // the main thread's default 8 MiB.
+        let src_for_errors = src.clone();
+        let result = std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(move || run_file(&path))
+            .expect("spawn interpreter thread")
+            .join()
+            .expect("interpreter thread panicked");
+        match result {
             Ok(output) => {
                 print!("{output}");
                 io::stdout().flush().ok();
             }
             Err(diags) => {
                 for d in &diags {
-                    eprint!("{}", render(&src, d));
+                    eprint!("{}", render(&src_for_errors, d));
                 }
                 std::process::exit(1);
             }
