@@ -134,6 +134,8 @@ struct Rt {
     str_tail: FuncRef,
     str_eq: FuncRef,
     str_snoc: FuncRef,
+    /// Reads a line from stdin as a fresh string box (0 at end of input).
+    read_line: FuncRef,
 }
 
 pub fn compile_object(program: &Program, types: &TypeInfo) -> Result<Vec<u8>, String> {
@@ -191,6 +193,19 @@ struct Compiler {
     adts: Vec<crate::infer::AdtDef>,
 }
 
+/// Imported libc/C-runtime helpers handed to `emit_runtime`.
+struct RtImports {
+    malloc: cranelift_module::FuncId,
+    free: cranelift_module::FuncId,
+    memcpy: cranelift_module::FuncId,
+    puts: cranelift_module::FuncId,
+    strlen: cranelift_module::FuncId,
+    itoa: cranelift_module::FuncId,
+    ftoa: cranelift_module::FuncId,
+    write: cranelift_module::FuncId,
+    read_line_raw: cranelift_module::FuncId,
+}
+
 impl Compiler {
     fn collect_signatures(&mut self, program: &Program) -> Result<(), String> {
         for item in &program.items {
@@ -219,8 +234,20 @@ impl Compiler {
         // needs variadic `snprintf`, which Cranelift's fixed ABI cannot drive.
         let itoa = self.declare_import("quill_itoa", &mut [types::I64], &mut [types::I64])?;
         let ftoa = self.declare_import("quill_ftoa", &mut [types::I64], &mut [types::I64])?;
+        // Line-at-a-time stdin reads also live in the C runtime (getline(3)).
+        let read_line_raw = self.declare_import("quill_read_line_raw", &mut [], &mut [types::I64])?;
 
-        self.emit_runtime(malloc, free, memcpy, puts, strlen, itoa, ftoa, write_import)?;
+        self.emit_runtime(RtImports {
+            malloc,
+            free,
+            memcpy,
+            puts,
+            strlen,
+            itoa,
+            ftoa,
+            write: write_import,
+            read_line_raw,
+        })?;
 
         let mut func_ids: HashMap<String, cranelift_module::FuncId> = HashMap::new();
         for item in &program.items {
@@ -508,17 +535,18 @@ impl Compiler {
             .map_err(|e| format!("declare {name}: {e}"))
     }
 
-    fn emit_runtime(
-        &mut self,
-        malloc: cranelift_module::FuncId,
-        free: cranelift_module::FuncId,
-        memcpy: cranelift_module::FuncId,
-        puts: cranelift_module::FuncId,
-        strlen: cranelift_module::FuncId,
-        itoa: cranelift_module::FuncId,
-        ftoa: cranelift_module::FuncId,
-        write_import: cranelift_module::FuncId,
-    ) -> Result<(), String> {
+    fn emit_runtime(&mut self, imports: RtImports) -> Result<(), String> {
+        let RtImports {
+            malloc,
+            free,
+            memcpy,
+            puts,
+            strlen,
+            itoa,
+            ftoa,
+            write: write_import,
+            read_line_raw,
+        } = imports;
         // quill_alloc(tag, nfields) -> ptr
         {
             let target_config = self.module.target_config();
@@ -1318,6 +1346,57 @@ impl Compiler {
             self.module
                 .define_function(id, &mut ctx)
                 .map_err(|e| format!("define quill_str_cstr: {e}"))?;
+        }
+
+        // quill_read_line() -> str box, or 0 at end of input. The raw C
+        // helper returns a malloc'd NUL-terminated line (NULL at EOF); here
+        // it is copied into a string box and freed.
+        {
+            let target_config = self.module.target_config();
+            let sig = plain_sig(0);
+            let id = self
+                .module
+                .declare_function("quill_read_line", Linkage::Local, &sig)
+                .map_err(|e| format!("declare quill_read_line: {e}"))?;
+            let mut ctx = self.module.make_context();
+            ctx.func.name = UserFuncName::testcase("quill_read_line");
+            ctx.func.signature = sig;
+            let raw_ref = self.module.declare_func_in_func(read_line_raw, &mut ctx.func);
+            let free_ref = self.module.declare_func_in_func(free, &mut ctx.func);
+            let strlen_ref = self.module.declare_func_in_func(strlen, &mut ctx.func);
+            let from_bytes_ref =
+                self.declare_rt_in(&mut ctx, "quill_str_from_bytes", &plain_sig(2));
+            {
+                let mut fctx = FunctionBuilderContext::new();
+                let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+                let block = bcx.create_block();
+                bcx.switch_to_block(block);
+                let call = bcx.ins().call(raw_ref, &[]);
+                let ptr = bcx.inst_results(call)[0];
+                let zero = bcx.ins().iconst(types::I64, 0);
+                let is_null = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    ptr,
+                    zero,
+                );
+                let eof_b = bcx.create_block();
+                let line_b = bcx.create_block();
+                bcx.ins().brif(is_null, eof_b, &[], line_b, &[]);
+                bcx.switch_to_block(eof_b);
+                bcx.ins().return_(&[zero]);
+                bcx.switch_to_block(line_b);
+                let call2 = bcx.ins().call(strlen_ref, &[ptr]);
+                let len = bcx.inst_results(call2)[0];
+                let call3 = bcx.ins().call(from_bytes_ref, &[ptr, len]);
+                let boxed = bcx.inst_results(call3)[0];
+                bcx.ins().call(free_ref, &[ptr]);
+                bcx.ins().return_(&[boxed]);
+                bcx.seal_all_blocks();
+                bcx.finalize(target_config);
+            }
+            self.module
+                .define_function(id, &mut ctx)
+                .map_err(|e| format!("define quill_read_line: {e}"))?;
         }
 
         // quill_char_str(byte) -> str — a one-character string box.
@@ -2132,6 +2211,7 @@ impl Compiler {
             str_tail: self.declare_rt_in(&mut ctx, "quill_str_tail", &plain_sig(1)),
             str_eq: self.declare_rt_in(&mut ctx, "quill_str_eq", &plain_sig(3)),
             str_snoc: self.declare_rt_in(&mut ctx, "quill_str_snoc", &plain_sig(2)),
+            read_line: self.declare_rt_in(&mut ctx, "quill_read_line", &plain_sig(0)),
         };
 
         {
@@ -3628,6 +3708,69 @@ impl Compiler {
                 release(bcx, rt, vals[0]);
                 Ok(box_char(bcx, merge_param, rt))
             }
+            "ord" => {
+                // Character (its unboxed code point) to Int.
+                let c = unbox(bcx, vals[0]);
+                release(bcx, rt, vals[0]);
+                Ok(box_int(bcx, c, rt))
+            }
+            "floor" | "ceil" => {
+                let f = unbox_float(bcx, vals[0]);
+                let r = if op == "floor" {
+                    bcx.ins().floor(f)
+                } else {
+                    bcx.ins().ceil(f)
+                };
+                let i = bcx.ins().fcvt_to_sint_sat(types::I64, r);
+                release(bcx, rt, vals[0]);
+                Ok(box_int(bcx, i, rt))
+            }
+            "_readLine" => {
+                // Internal for Std.IO: `None` at end of input, `Some line`
+                // otherwise. Std.IO imports Std.Option, so the constructors
+                // are always in the program when this is reached.
+                let none_idx = self
+                    .info
+                    .ctor_of("Std.Option.None")
+                    .ok_or_else(|| "`_readLine` requires Std.Option (import Std.IO)".to_string())?;
+                let some_idx = self
+                    .info
+                    .ctor_of("Std.Option.Some")
+                    .ok_or_else(|| "`_readLine` requires Std.Option (import Std.IO)".to_string())?;
+                let call = bcx.ins().call(rt.read_line, &[]);
+                let s = bcx.inst_results(call)[0];
+                let zero = bcx.ins().iconst(types::I64, 0);
+                let is_null = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    s,
+                    zero,
+                );
+                let none_b = bcx.create_block();
+                let some_b = bcx.create_block();
+                let merge_b = bcx.create_block();
+                let merge_param = bcx.append_block_param(merge_b, types::I64);
+                bcx.ins().brif(is_null, none_b, &[], some_b, &[]);
+                bcx.switch_to_block(none_b);
+                let tag0 = bcx.ins().iconst(types::I64, none_idx as i64);
+                let n0 = bcx.ins().iconst(types::I64, 0);
+                let none_call = bcx.ins().call(rt.alloc, &[tag0, n0]);
+                let none_obj = bcx.inst_results(none_call)[0];
+                bcx.ins().jump(merge_b, &[BlockArg::Value(none_obj)]);
+                bcx.switch_to_block(some_b);
+                let tag1 = bcx.ins().iconst(types::I64, some_idx as i64);
+                let n1 = bcx.ins().iconst(types::I64, 1);
+                let some_call = bcx.ins().call(rt.alloc, &[tag1, n1]);
+                let some_obj = bcx.inst_results(some_call)[0];
+                // The string box from quill_read_line becomes the field; the
+                // constructor takes ownership of it.
+                bcx.ins().store(MemFlagsData::new(), s, some_obj, 24);
+                bcx.ins().jump(merge_b, &[BlockArg::Value(some_obj)]);
+                bcx.seal_block(none_b);
+                bcx.seal_block(some_b);
+                bcx.seal_block(merge_b);
+                bcx.switch_to_block(merge_b);
+                Ok(merge_param)
+            }
             "snoc" => {
                 let call = bcx.ins().call(rt.str_snoc, &[vals[0], vals[1]]);
                 let r = bcx.inst_results(call)[0];
@@ -3707,7 +3850,11 @@ fn is_builtin(op: &str) -> bool {
             | "show"
             | "error"
             | "chr"
+            | "ord"
+            | "floor"
+            | "ceil"
             | "snoc"
+            | "_readLine"
     )
 }
 

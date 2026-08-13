@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 /* Decimal representation of a boxed Int payload. */
 char *quill_itoa(long n) {
@@ -62,4 +64,20 @@ char *quill_ftoa(long bits) {
     }
     memcpy(out, buf, (size_t)len + 1);
     return out;
+}
+
+/* Read one line of stdin without its trailing newline/CR; NULL at end of
+ * input. The returned buffer is malloc'd; the caller boxes it and frees it. */
+char *quill_read_line_raw(void) {
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, stdin);
+    if (n < 0) {
+        free(line);
+        return NULL;
+    }
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+        line[--n] = '\0';
+    }
+    return line;
 }
