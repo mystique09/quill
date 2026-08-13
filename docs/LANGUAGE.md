@@ -119,7 +119,8 @@ Quill programs can span multiple files.
 `use` resolves a module by replacing `.` with `/` and appending `.q`, looking in
 the current directory (or the importing file's directory for a file program).
 The standard library modules — `Std.List`, `Std.Option`, `Std.Result`,
-`Std.Function` — are embedded in the interpreter and need no files on disk.
+`Std.Function`, `Std.String`, `Std.Tuple`, `Std.Math`, `Std.IO` — are embedded
+in the interpreter and need no files on disk.
 
 `Std.List` is the *implicit prelude*: its exports (`map`, `filter`, `foldl`,
 `foldr`, `head`, `tail`, `length`, `reverse`, `sum`, …) are available
@@ -169,7 +170,8 @@ main = let mut total = 0
 ## The prelude
 
 The primitive builtins: `+ - * / % negate`, `== /= < <= > >=`, `&& || not`,
-`:`, `++`, `show println print error sqrt chr snoc`, `otherwise`.
+`:`, `++`, `show println print error sqrt chr ord floor ceil snoc`,
+`otherwise`.
 
 `==`, `<`, and `show` are structural and work on any value; `+` requires the
 `Num` class and `++` the `Append` class. The list functions (`map`, `filter`,
@@ -180,8 +182,31 @@ Quill code in `Std.List`, which is imported implicitly.
 streams to stdout immediately (the tree-walking interpreter still buffers).
 Strings support cons patterns: `(c:cs)` destructures a string into its first
 character and the rest (when the pattern's type is `String`). `chr` maps a
-byte (mod 256) to its `Char`, and `snoc` appends a `Char` to a `String` —
-together they make character-level I/O possible without `do`-notation.
+byte (mod 256) to its `Char`, `ord` is its inverse (a character's code point
+as an `Int`), and `snoc` appends a `Char` to a `String` — together they make
+character-level I/O possible without `do`-notation. `floor` and `ceil` round
+a `Float` to an `Int`; `Std.Math` builds the rest (`abs`, `pow`, `round`,
+`gcd`, …) on top of them.
+
+## Standard input
+
+`Std.IO` provides `readLine :: () -> Option String` (yielding `None` at end
+of input, so loops over stdin terminate), plus `getLines` and `readAll`:
+
+```haskell
+use Std.IO as IO
+use Std.Option
+
+echo :: Option String -> String
+echo None     = "bye"
+echo (Some l) = "you said: " ++ l
+
+main = println (echo (IO.readLine ()))
+```
+
+Input works in both the interpreter and compiled binaries. End of input
+yields `None`; a genuine read error (e.g. stdin closed) is a runtime error
+in the interpreter and traps in compiled binaries.
 
 ## `main`
 
@@ -191,25 +216,32 @@ non-unit value, that value is printed. `println` writes directly to stdout.
 ## Compiling to native code
 
 `quill build file.q [output]` compiles a program to a native executable using
-Cranelift. The compiler supports `Int`, `Float`, `Bool`, arithmetic and
+Cranelift; `cargo run -- file.q` (or `quill file.q`) instead runs it on the
+tree-walking interpreter. Both execute the same language, but they are
+different engines — the interpreter is slow and buffers `print`, while
+compiled binaries run fast and stream output. The compiler supports `Int`,
+`Float`, `Bool`, arithmetic and
 comparison (with tag-dispatched `Int`/`Float`), `if`, `case` expressions,
 top-level function calls (uncurried), recursion, pattern matching over `Int`,
 `Bool`, `Float`, and algebraic data types (including nested, tuple, record,
-and wildcard patterns), `String` literals with `++` and `println`, lists (list
+and wildcard patterns), `String` literals with `++`, structural `println` and
+`print` of any value, lists (list
 literals, `:` cons, `++` append, and list patterns), tuples, records
 (construction, projection, and patterns), `let`/`where` local bindings
 (including `mut` bindings and `:=`, implemented with shared cells so closures
 mutate the same storage), lambdas (including those that capture enclosing
 variables), higher-order functions, partial application, structural `show`,
-type classes (method dispatch on the receiver's runtime constructor tag), and
+type classes (method dispatch on the receiver's runtime constructor tag),
+string cons patterns with `chr`/`ord`/`snoc`, `floor`/`ceil`, stdin via
+`Std.IO`, and
 the standard library (the implicit `Std.List` prelude and `use`d modules are
 compiled into the object). The compiled `main` returns its result as the
 process exit code.
 
-Number formatting in `show` is provided by a small C runtime
-(`runtime/quill-rt.c`) compiled and linked by `quill build`. Values are
-uniformly boxed (every value is a reference-counted heap object), so
-polymorphic functions compile soundly, and releasing an object recursively
+Number formatting in `show` and line-at-a-time stdin reads are provided by a
+small C runtime (`runtime/quill-rt.c`) compiled and linked by `quill build`.
+Values are uniformly boxed (every value is a reference-counted heap object),
+so polymorphic functions compile soundly, and releasing an object recursively
 releases its fields.
 
 ## Known simplifications

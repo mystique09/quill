@@ -259,6 +259,10 @@ impl<'a> Lexer<'a> {
         // Char literals
         if c == '\'' {
             self.bump();
+            // `escape_char` expects the backslash to be consumed already.
+            if self.peek() == Some(b'\\') {
+                self.bump();
+            }
             let (ch, _) = self.escape_char()?;
             if self.peek() != Some(b'\'') {
                 return Err(Diagnostic::error(
@@ -294,6 +298,8 @@ impl<'a> Lexer<'a> {
                         break;
                     }
                     Some(b'\\') => {
+                        // `escape_char` expects the backslash to be consumed.
+                        self.bump();
                         let (ch, _) = self.escape_char()?;
                         s.push(ch);
                     }

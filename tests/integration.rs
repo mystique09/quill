@@ -438,3 +438,734 @@ fn brainfuck_example() {
         .unwrap();
     assert_eq!(output.unwrap(), "Hello World!\n");
 }
+
+#[test]
+fn stdlib_string() {
+    let src = r#"
+use Std.String as S
+main = println
+  ( S.toUpper "hElLo" ++ " " ++ show (S.lines "a\nb\nc") ++ " "
+    ++ show (S.words "foo  bar\tbaz") ++ " " ++ show (S.split ',' "a,,b,c") ++ " "
+    ++ S.join "-" ["x", "y"] ++ " " ++ S.trim "  hi  " ++ " "
+    ++ show (S.startsWith "he" "hello") ++ " " ++ show (S.endsWith "lo" "hello") ++ " "
+    ++ show (S.contains "ell" "hello") ++ " " ++ S.fromChars ['a', 'b'] ++ " "
+    ++ show (S.toChars "ab") ++ " " ++ S.repeat "ab" 2 )
+"#;
+    assert_eq!(
+        run_ok(src),
+        "HELLO [a, b, c] [foo, bar, baz] [a, , b, c] x-y hi true true true ab ['a', 'b'] abab\n"
+    );
+}
+
+#[test]
+fn stdlib_tuple_math() {
+    let src = r#"
+use Std.Tuple as T
+use Std.Math as M
+main = println
+  ( show (T.fst (1, 2)) ++ " " ++ show (T.snd (1, 2)) ++ " " ++ show (T.swap (1, 2)) ++ " "
+    ++ show (T.uncurry (\x y -> x + y) (2, 3)) ++ " " ++ show (M.abs (-5)) ++ " "
+    ++ show (M.pow 2 8) ++ " " ++ show (M.min 3 7) ++ " " ++ show (M.max 3 7) ++ " "
+    ++ show (M.clamp 0 10 42) ++ " " ++ show (M.even 4) ++ " " ++ show (M.odd 4) ++ " "
+    ++ show (M.gcd 12 18) ++ " " ++ show (M.round 2.5) ++ " " ++ show (floor 2.7)
+    ++ " " ++ show (ceil 2.1) ++ " " ++ show (ord 'A') )
+"#;
+    assert_eq!(
+        run_ok(src),
+        "1 2 (2, 1) 5 5 256 3 7 10 true false 6 3 2 3 65\n"
+    );
+}
+
+#[test]
+fn stdlib_io_typechecks() {
+    // Std.IO's readLine is typed `() -> Option String` via a native helper;
+    // this checks the module loads and typechecks (stdin is not exercised).
+    let src = r#"
+use Std.IO as IO
+use Std.Option
+main = println (case IO.readLine () of { None -> "no input"; Some l -> l })
+"#;
+    quill::check(src).unwrap();
+}
+
+#[test]
+fn char_escapes() {
+    // Regression: escapes must work in both char and string literals (the
+    // lexer used to skip the backslash twice, breaking '\t' and friends).
+    let src = r#"
+main = println (show ('\n' == '\n') ++ " " ++ show ("a\nb" == "a" ++ "\n" ++ "b") ++ " " ++ show (ord '\t'))
+"#;
+    assert_eq!(run_ok(src), "true true 9\n");
+}
+
+#[test]
+fn native_compile_stdlib_string() {
+    // Std.String exercises the compiled backend's string cons patterns,
+    // `chr`/`ord`/`snoc`, and `++`.
+    let dir = std::env::temp_dir().join("quill_native_stdstr_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.q");
+    std::fs::write(
+        &path,
+        "use Std.String as S\n\
+         use Std.Math as M\n\
+         main = println\n\
+         \x20 ( S.toUpper \"hi\" ++ S.trim \" x \" ++ show (S.split ',' \"a,b\")\n\
+         \x20   ++ \" \" ++ show (M.round 2.5) ++ \" \" ++ show (floor 2.7) ++ \" \" ++ show (ord 'A') )\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(
+        object.len() > 100,
+        "object too small: {} bytes",
+        object.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Link and run a compiled program that uses the new stdlib modules and
+/// reads a line from piped stdin. Skipped when no C compiler is available.
+#[test]
+fn native_link_and_run_stdlib() {
+    let dir = std::env::temp_dir().join("quill_native_stdlib_run_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run.q");
+    std::fs::write(
+        &path,
+        "use Std.IO as IO\n\
+         use Std.Option\n\
+         use Std.String as S\n\
+         use Std.Math as M\n\
+         showLine :: Option String -> String\n\
+         showLine None = \"none\"\n\
+         showLine (Some l) = l\n\
+         main = println\n\
+         \x20 ( S.toUpper (showLine (IO.readLine ())) ++ \" \" ++ show (S.lines \"a\\nb\")\n\
+         \x20   ++ \" \" ++ show (M.round 2.5) ++ \" \" ++ show (floor 2.7) ++ \" \" ++ show (ord 'A') )\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("run.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("run");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    // Feed one line on stdin and read the process's stdout.
+    let mut child = std::process::Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"hello world\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "HELLO WORLD [a, b] 3 2 65\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn readline_intrinsic_is_typed() {
+    // `_readLine` is internal to Std.IO: it is never bound for user code (the
+    // intrinsic lives under the module-qualified flat name `Std.IO._readLine`,
+    // which source identifiers cannot spell), so direct use is a compile-time
+    // error — never a runtime crash or garbage.
+    let e = run_err("main = println (show (_readLine () + 1))");
+    assert!(e.contains("unbound name"), "got: {e}");
+    let e = run_err("use Std.IO\nmain = println (show (_readLine () + 1))");
+    assert!(e.contains("unbound name"), "got: {e}");
+    // A user's own `_readLine` definition is a perfectly ordinary function.
+    let src = "_readLine _ = 42\nmain = println (show (_readLine ()))";
+    assert_eq!(run_ok(src), "42\n");
+}
+
+#[test]
+fn readline_intrinsic_isolated_from_user_defs() {
+    // Even when the importing program defines `_readLine`, Std.IO's readLine
+    // must keep calling the intrinsic (typed `() -> Option String`), not the
+    // user's function. (stdin is not exercised here; this is typecheck-only.)
+    let src = r#"
+use Std.IO as IO
+use Std.Option
+_readLine _ = 42
+main = println (case IO.readLine () of { None -> "none"; Some l -> l })
+"#;
+    quill::check(src).unwrap();
+}
+
+/// Compiled programs preserve embedded NUL bytes in stdin lines (the C
+/// runtime reports the line length instead of relying on strlen). Observed
+/// through `toChars`, since printing the raw string would stop at the NUL.
+/// Skipped when no C compiler is available.
+#[test]
+fn native_readline_nul() {
+    let dir = std::env::temp_dir().join("quill_native_nul_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nul.q");
+    std::fs::write(
+        &path,
+        "use Std.IO as IO\n\
+         use Std.Option\n\
+         use Std.String as S\n\
+         line :: Option String -> String\n\
+         line None = \"\"\n\
+         line (Some l) = l\n\
+         main = println (show (length (S.toChars (line (IO.readLine ())))))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("nul.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("nul");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let mut child = std::process::Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"a\0b\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn builtin_shadowed_by_user_definition() {
+    // A top-level definition with a builtin's name replaces the prelude
+    // entry in the interpreter (the native half is native_builtin_shadowing).
+    let src = r#"
+_readLine _ = 42
+show _ = 42
+main = println (show (_readLine () + show 1))
+"#;
+    assert_eq!(run_ok(src), "42\n");
+}
+
+/// Compiled programs also let user definitions shadow builtins of the same
+/// name — the result is returned as the exit code (and no stdin is read,
+/// since the user's `_readLine` replaces the intrinsic). Skipped when no C
+/// compiler is available.
+#[test]
+fn native_builtin_shadowing() {
+    let dir = std::env::temp_dir().join("quill_native_shadow_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shadow.q");
+    std::fs::write(
+        &path,
+        "_readLine _ = 40\n\
+         show _ = 2\n\
+         main = _readLine () + show 1\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("shadow.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("shadow");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    // `main` returns the value, which becomes the process exit code: 42
+    // proves both shadowing definitions ran (40 + 2).
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "expected exit code 42, got {:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compiled `println` formats any value structurally (Int, Bool, Char,
+/// lists, tuples) instead of trapping on non-strings — parity with the
+/// interpreter. Skipped when no C compiler is available.
+#[test]
+fn native_println_any_value() {
+    let dir = std::env::temp_dir().join("quill_native_println_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("p.q");
+    std::fs::write(
+        &path,
+        "f x = x + 2\n\
+         main = let _ = println (f 40) in\n\
+         \x20\x20\x20\x20\x20\x20\x20let _ = println True in\n\
+         \x20\x20\x20\x20\x20\x20\x20let _ = println [1, 2] in\n\
+         \x20\x20\x20\x20\x20\x20\x20let _ = println (1, \"a\") in\n\
+         \x20\x20\x20\x20\x20\x20\x20println 'x'\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("p.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("p");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "42\ntrue\n[1, 2]\n(1, a)\n'x'\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_local_builtin_shadowing() {
+    let dir = std::env::temp_dir().join("quill_native_local_shadow_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shadow.q");
+    std::fs::write(
+        &path,
+        "main = let ord = \\_ -> 42 in let otherwise = 7 in println (show (ord 'A' + otherwise))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("shadow.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("shadow");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "49\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compiled unit values print `()` (the interpreter's format), not `0`.
+/// Link-and-run; skipped when no C compiler is available.
+#[test]
+fn native_unit_formatting() {
+    let dir = std::env::temp_dir().join("quill_native_unit_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("u.q");
+    std::fs::write(
+        &path,
+        "main = let _ = println () in let _ = println (show ()) in println (show (() == ()))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("u.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("u");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "()\n()\ntrue\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compiled string cons patterns decode full UTF-8 characters, so `toChars`
+/// matches the interpreter on non-ASCII input. Link-and-run; skipped when no
+/// C compiler is available.
+#[test]
+fn native_utf8_tochars() {
+    let dir = std::env::temp_dir().join("quill_native_utf8_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("utf8.q");
+    std::fs::write(
+        &path,
+        "use Std.String as S\n\
+         main = println (show (length (S.toChars \"é\")) ++ \" \" ++ show (S.toChars \"aé中\") ++ \" \" ++ S.fromChars (S.toChars \"héllo\"))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("utf8.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("utf8");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1 ['a', 'é', '中'] héllo\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stdin read error (closed stdin) traps in compiled programs instead of
+/// being silently reported as end of input. Skipped without a C toolchain or
+/// a POSIX shell.
+#[cfg(unix)]
+#[test]
+fn native_readline_error_traps() {
+    let dir = std::env::temp_dir().join("quill_native_rlerr_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rlerr.q");
+    std::fs::write(
+        &path,
+        "use Std.IO as IO\n\
+         use Std.Option\n\
+         main = println (case IO.readLine () of { None -> \"eof\"; Some l -> l })\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("rlerr.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("rlerr");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    // Close stdin before running the binary: getline fails with EBADF, which
+    // must trap rather than yield None ("eof").
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("exec 0<&-; exec {}", bin_path.display()))
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "expected the read error to trap, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repeat_negative_terminates() {
+    // `repeat` with a negative count returns the empty string instead of
+    // diverging (both engines; the native half is
+    // native_builtins_as_values).
+    let src = r#"
+use Std.String as S
+main = println (show (S.repeat "ab" (-1)) ++ "|" ++ S.repeat "x" 3)
+"#;
+    assert_eq!(run_ok(src), "|xxx\n");
+}
+
+/// Builtins work as first-class values (`map ord ...`), `sqrt` compiles,
+/// and `repeat` handles negative counts — link-and-run; skipped without a C
+/// compiler.
+#[test]
+fn native_builtins_as_values() {
+    let dir = std::env::temp_dir().join("quill_native_bv_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bv.q");
+    std::fs::write(
+        &path,
+        "use Std.String as S\n\
+         main = let _ = println (show (map ord ['A', 'B'])) in\n\
+         \x20\x20\x20\x20\x20\x20\x20let _ = println (show (sqrt 9.0)) in\n\
+         \x20\x20\x20\x20\x20\x20\x20println (show (S.repeat \"ab\" (-1)) ++ \"|\" ++ S.repeat \"x\" 3)\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("bv.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("bv");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[65, 66]\n3.0\n|xxx\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compiled readLine rejects invalid UTF-8 by trapping, like the
+/// interpreter's read_line error (a valid line still round-trips). Skipped
+/// without a C compiler.
+#[test]
+fn native_readline_invalid_utf8_traps() {
+    let dir = std::env::temp_dir().join("quill_native_badutf8_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bad.q");
+    std::fs::write(
+        &path,
+        "use Std.IO as IO\n\
+         use Std.Option\n\
+         main = println (case IO.readLine () of { None -> \"eof\"; Some l -> l })\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("bad.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("bad");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    // Invalid UTF-8 on stdin must trap…
+    let mut child = std::process::Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"\xff\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "expected invalid UTF-8 to trap, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // …while a valid line round-trips.
+    let mut child2 = std::process::Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child2.stdin.as_mut().unwrap(), b"h\xc3\xa9\n").unwrap();
+    let output2 = child2.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output2.stdout), "hé\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compiled `println` writes the full byte length, so embedded NUL bytes
+/// survive (the interpreter prints them too). Skipped without a C compiler.
+#[test]
+fn native_println_nul() {
+    let dir = std::env::temp_dir().join("quill_native_println_nul_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nul.q");
+    std::fs::write(&path, "main = println \"a\\0b\"\n").unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("nul.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("nul");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"a\0b\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A nested lambda captures a local that shadows a builtin (the lexical
+/// binding wins over the builtin, like the interpreter). Link-and-run;
+/// skipped without a C compiler.
+#[test]
+fn native_captured_builtin_shadowing() {
+    let dir = std::env::temp_dir().join("quill_native_capshadow_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cap.q");
+    std::fs::write(
+        &path,
+        "main = let ord = \\_ -> 42 in let f = \\c -> ord c in println (show (f 'A'))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("cap.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("cap");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Generated function names (`$builtin_N`, `$lambda_N`) cannot collide with
+/// user definitions — `q_builtin_0`/`q_lambda_0` are ordinary user names —
+/// even when builtin wrappers are synthesized. Link-and-run; skipped without
+/// a C compiler.
+#[test]
+fn native_generated_name_collision() {
+    let dir = std::env::temp_dir().join("quill_native_genname_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gen.q");
+    std::fs::write(
+        &path,
+        "q_builtin_0 _ = 42\n\
+         q_lambda_0 x = x + 1\n\
+         main = println (show (q_builtin_0 1) ++ \" \" ++ show (q_lambda_0 1) ++ \" \" ++ show (map ord ['A']))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("gen.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("gen");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42 2 [65]\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

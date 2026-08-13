@@ -66,6 +66,9 @@ const TAG_TUPLE: i64 = -8;
 const TAG_CELL: i64 = -9;
 /// A single character; the payload word holds its (ASCII) byte value.
 const TAG_CHAR: i64 = -10;
+/// The unit value `()`: a single-payload box like Int/Bool, so `show`
+/// distinguishes it from the integer 0 (the interpreter prints `()`).
+const TAG_UNIT: i64 = -11;
 
 struct CodegenInfo {
     /// Constructor name -> globally unique constructor index (the object tag).
@@ -131,9 +134,12 @@ struct Rt {
     make_closure: FuncRef,
     apply: FuncRef,
     show: FuncRef,
-    str_tail: FuncRef,
+    /// Fresh box holding s[n..] (UTF-8 string cons patterns).
+    str_tail_n: FuncRef,
     str_eq: FuncRef,
     str_snoc: FuncRef,
+    /// Reads a line from stdin as a fresh string box (0 at end of input).
+    read_line: FuncRef,
 }
 
 pub fn compile_object(program: &Program, types: &TypeInfo) -> Result<Vec<u8>, String> {
@@ -166,6 +172,7 @@ pub fn compile_object(program: &Program, types: &TypeInfo) -> Result<Vec<u8>, St
         method_dispatch: HashMap::new(),
         instances: types.instances.clone(),
         adts: types.adts.clone(),
+        builtin_values: HashMap::new(),
     };
     c.collect_signatures(program)?;
     c.compile_program(program)
@@ -189,6 +196,23 @@ struct Compiler {
     method_dispatch: HashMap<String, Vec<(Vec<usize>, cranelift_module::FuncId)>>,
     instances: Vec<InstanceInfo>,
     adts: Vec<crate::infer::AdtDef>,
+    /// Builtin name -> synthesized wrapper function (`\x -> ord x`, …) so
+    /// builtins can be used as first-class values, like the interpreter's
+    /// prelude.
+    builtin_values: HashMap<String, String>,
+}
+
+/// Imported libc/C-runtime helpers handed to `emit_runtime`.
+struct RtImports {
+    malloc: cranelift_module::FuncId,
+    free: cranelift_module::FuncId,
+    memcpy: cranelift_module::FuncId,
+    strlen: cranelift_module::FuncId,
+    itoa: cranelift_module::FuncId,
+    ftoa: cranelift_module::FuncId,
+    write: cranelift_module::FuncId,
+    read_line_raw: cranelift_module::FuncId,
+    read_line_len: cranelift_module::FuncId,
 }
 
 impl Compiler {
@@ -207,7 +231,6 @@ impl Compiler {
         let malloc = self.declare_import("malloc", &mut [types::I64], &mut [types::I64])?;
         let free = self.declare_import("free", &mut [types::I64], &mut [])?;
         let memcpy = self.declare_import("memcpy", &mut [types::I64, types::I64, types::I64], &mut [types::I64])?;
-        let puts = self.declare_import("puts", &mut [types::I64], &mut [types::I64])?;
         let strlen = self.declare_import("strlen", &mut [types::I64], &mut [types::I64])?;
         // `print` streams bytes straight to stdout via write(2).
         let write_import = self.declare_import(
@@ -219,8 +242,23 @@ impl Compiler {
         // needs variadic `snprintf`, which Cranelift's fixed ABI cannot drive.
         let itoa = self.declare_import("quill_itoa", &mut [types::I64], &mut [types::I64])?;
         let ftoa = self.declare_import("quill_ftoa", &mut [types::I64], &mut [types::I64])?;
+        // Line-at-a-time stdin reads also live in the C runtime (getline(3)).
+        // The length comes back separately so embedded NUL bytes survive.
+        let read_line_raw = self.declare_import("quill_read_line_raw", &mut [], &mut [types::I64])?;
+        let read_line_len =
+            self.declare_import("quill_read_line_raw_len", &mut [], &mut [types::I64])?;
 
-        self.emit_runtime(malloc, free, memcpy, puts, strlen, itoa, ftoa, write_import)?;
+        self.emit_runtime(RtImports {
+            malloc,
+            free,
+            memcpy,
+            strlen,
+            itoa,
+            ftoa,
+            write: write_import,
+            read_line_raw,
+            read_line_len,
+        })?;
 
         let mut func_ids: HashMap<String, cranelift_module::FuncId> = HashMap::new();
         for item in &program.items {
@@ -236,28 +274,47 @@ impl Compiler {
 
         // Collect every lambda (with its captured variables), assign it a
         // generated name, and declare it.
-        let mut raw_lambdas: Vec<(usize, Vec<Pattern>, Box<Expr>, crate::error::Span)> =
-            Vec::new();
+        let mut raw_lambdas: Vec<(
+            usize,
+            Vec<Pattern>,
+            Box<Expr>,
+            crate::error::Span,
+            std::collections::HashSet<String>,
+        )> = Vec::new();
         for item in &program.items {
             if let Item::Function(f) = item {
                 for clause in &f.clauses {
-                    collect_lambdas(&clause.body, &mut raw_lambdas);
+                    let mut bound: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for p in &clause.pats {
+                        pat_vars(p, &mut bound);
+                    }
+                    collect_lambdas(&clause.body, &mut bound, &mut raw_lambdas);
                 }
             }
         }
         let mut lambda_fns: Vec<(Function, Vec<String>, std::collections::HashSet<String>)> =
             Vec::new();
-        for (i, (span_lo, params, body, span)) in raw_lambdas.iter().enumerate() {
-            let name = format!("q_lambda_{i}");
+        for (i, (span_lo, params, body, span, enclosing)) in raw_lambdas.iter().enumerate() {
+            let name = format!("$lambda_{i}");
             // Captured variables are the free variables that resolve to the
-            // enclosing scope's locals — i.e. not builtins, constructors, or
-            // top-level functions (those resolve statically).
+            // enclosing scope's locals. Names bound anywhere between the
+            // lambda and the top level — including locals that shadow a
+            // builtin, like `let ord = ...` — are captured; only names that
+            // resolve statically (builtins, constructors, top-level
+            // functions) are not.
             let free_vars: Vec<String> = lambda_free_vars(params, body)
                 .into_iter()
                 .filter(|n| {
-                    !is_builtin(n)
-                        && self.info.ctor_of(n).is_none()
-                        && !self.arities.contains_key(n)
+                    // A name bound between the lambda and the top level —
+                    // including a local that shadows a builtin, like
+                    // `let ord = ...` — is captured. Otherwise, only names
+                    // that do NOT resolve statically (builtins,
+                    // constructors, top-level functions) are captured.
+                    enclosing.contains(n)
+                        || (!is_builtin(n)
+                            && self.info.ctor_of(n).is_none()
+                            && !self.arities.contains_key(n))
                 })
                 .collect();
             // Captured variables the body mutates must be cells so the
@@ -292,6 +349,56 @@ impl Compiler {
                 },
                 free_vars,
                 cell_vars,
+            ));
+        }
+
+        // Builtins used as values (e.g. `map ord ['A']`): synthesize a
+        // wrapper function per builtin (`\x -> ord x`, `\x y -> x + y`, …)
+        // and remember the mapping so the Var-as-value path can materialize
+        // a closure, like the interpreter's prelude does. The internal
+        // `_readLine` intrinsic is not usable as a value and is skipped.
+        let builtins: [(&str, usize); 27] = [
+            ("+", 2), ("-", 2), ("*", 2), ("/", 2), ("%", 2), ("negate", 1),
+            ("==", 2), ("/=", 2), ("<", 2), ("<=", 2), (">", 2), (">=", 2),
+            ("&&", 2), ("||", 2), ("not", 1), ("++", 2), (":", 2),
+            ("println", 1), ("print", 1), ("show", 1), ("error", 1),
+            ("sqrt", 1), ("chr", 1), ("ord", 1), ("floor", 1), ("ceil", 1),
+            ("snoc", 2),
+        ];
+        for (i, (bname, arity)) in builtins.iter().enumerate() {
+            let fname = format!("$builtin_{i}");
+            let pats: Vec<Pattern> = (0..*arity)
+                .map(|k| Pattern::Var(format!("$b{k}"), crate::error::Span::default()))
+                .collect();
+            let mut body = Expr::Var((*bname).to_string(), crate::error::Span::default());
+            for k in 0..*arity {
+                body = Expr::App(
+                    Box::new(body),
+                    Box::new(Expr::Var(
+                        format!("$b{k}"),
+                        crate::error::Span::default(),
+                    )),
+                    crate::error::Span::default(),
+                );
+            }
+            self.arities.insert(fname.clone(), *arity);
+            self.builtin_values.insert((*bname).to_string(), fname.clone());
+            let id = self
+                .module
+                .declare_function(&fname, Linkage::Local, &fn_sig(2))
+                .map_err(|e| format!("declare {fname}: {e}"))?;
+            func_ids.insert(fname.clone(), id);
+            lambda_fns.push((
+                Function {
+                    name: fname,
+                    clauses: vec![Clause {
+                        pats,
+                        body,
+                        span: crate::error::Span::default(),
+                    }],
+                },
+                Vec::new(),
+                std::collections::HashSet::new(),
             ));
         }
 
@@ -363,7 +470,7 @@ impl Compiler {
                 });
             }
             for (k, (mname, clauses)) in clauses_by_name.into_iter().enumerate() {
-                let name = format!("q_inst_{inst_count}_{k}");
+                let name = format!("$inst_{inst_count}_{k}");
                 let arity = clauses.first().map(|c| c.pats.len()).unwrap_or(0);
                 let free_vars: Vec<String> = clauses
                     .iter()
@@ -409,21 +516,33 @@ impl Compiler {
 
             // Nested lambdas inside the instance's method bodies are compiled
             // like top-level lambdas (own function, captured free variables).
-            let mut raw_inst_lambdas: Vec<(usize, Vec<Pattern>, Box<Expr>, crate::error::Span)> =
-                Vec::new();
+            let mut raw_inst_lambdas: Vec<(
+                usize,
+                Vec<Pattern>,
+                Box<Expr>,
+                crate::error::Span,
+                std::collections::HashSet<String>,
+            )> = Vec::new();
             for (f, _, _) in &inst_fns {
                 for c in &f.clauses {
-                    collect_lambdas(&c.body, &mut raw_inst_lambdas);
+                    let mut bound: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for p in &c.pats {
+                        pat_vars(p, &mut bound);
+                    }
+                    collect_lambdas(&c.body, &mut bound, &mut raw_inst_lambdas);
                 }
             }
-            for (i, (span_lo, params, body, span)) in raw_inst_lambdas.iter().enumerate() {
-                let name = format!("q_instlam_{inst_count}_{i}");
+            for (i, (span_lo, params, body, span, enclosing)) in raw_inst_lambdas.iter().enumerate()
+            {
+                let name = format!("$instlam_{inst_count}_{i}");
                 let free_vars: Vec<String> = lambda_free_vars(params, body)
                     .into_iter()
                     .filter(|n| {
-                        !is_builtin(n)
-                            && self.info.ctor_of(n).is_none()
-                            && !self.arities.contains_key(n)
+                        enclosing.contains(n)
+                            || (!is_builtin(n)
+                                && self.info.ctor_of(n).is_none()
+                                && !self.arities.contains_key(n))
                     })
                     .collect();
                 let assigned = assigned_names(body);
@@ -508,17 +627,20 @@ impl Compiler {
             .map_err(|e| format!("declare {name}: {e}"))
     }
 
-    fn emit_runtime(
-        &mut self,
-        malloc: cranelift_module::FuncId,
-        free: cranelift_module::FuncId,
-        memcpy: cranelift_module::FuncId,
-        puts: cranelift_module::FuncId,
-        strlen: cranelift_module::FuncId,
-        itoa: cranelift_module::FuncId,
-        ftoa: cranelift_module::FuncId,
-        write_import: cranelift_module::FuncId,
-    ) -> Result<(), String> {
+    fn emit_runtime(&mut self, imports: RtImports) -> Result<(), String> {
+        let RtImports {
+            malloc,
+            free,
+            memcpy,
+            strlen,
+            itoa,
+            ftoa,
+            write: write_import,
+            read_line_raw,
+            read_line_len,
+        } = imports;
+        // A lone newline for `println` (written by length, so no NUL needed).
+        let s_newline_id = self.declare_bytes("quill_s_newline", b"\n");
         // quill_alloc(tag, nfields) -> ptr
         {
             let target_config = self.module.target_config();
@@ -699,7 +821,10 @@ impl Compiler {
                 .map_err(|e| format!("define quill_str_concat: {e}"))?;
         }
 
-        // quill_println(s) — write the string's bytes and a newline to stdout.
+        // quill_println(v) — format any value structurally (via quill_show)
+        // and write its bytes plus a newline to stdout, like the
+        // interpreter. `write` is used with the stored byte length so
+        // embedded NUL bytes survive (puts would stop at the first NUL).
         {
             let target_config = self.module.target_config();
             let mut sig = Signature::new(CallConv::SystemV);
@@ -711,7 +836,10 @@ impl Compiler {
             let mut ctx = self.module.make_context();
             ctx.func.name = UserFuncName::testcase("quill_println");
             ctx.func.signature = sig;
-            let puts_ref = self.module.declare_func_in_func(puts, &mut ctx.func);
+            let write_ref = self.module.declare_func_in_func(write_import, &mut ctx.func);
+            let show_ref = self.declare_rt_in(&mut ctx, "quill_show", &plain_sig(1));
+            let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
+            let s_nl_gv = self.module.declare_data_in_func(s_newline_id, &mut ctx.func);
             {
                 let mut fctx = FunctionBuilderContext::new();
                 let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -719,23 +847,15 @@ impl Compiler {
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
                 let p = bcx.block_params(block)[0];
-                // `println` currently only formats strings; trap on any other
-                // value rather than misreading its payload as a C string.
-                let tag = bcx.ins().load(types::I64, MemFlagsData::new(), p, 8);
-                let str_tag = bcx.ins().iconst(types::I64, TAG_STR);
-                let is_str = bcx.ins().icmp(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    tag,
-                    str_tag,
-                );
-                let ok = bcx.create_block();
-                let bad = bcx.create_block();
-                bcx.ins().brif(is_str, ok, &[], bad, &[]);
-                bcx.switch_to_block(bad);
-                bcx.ins().trap(TrapCode::unwrap_user(3));
-                bcx.switch_to_block(ok);
-                let data = bcx.ins().iadd_imm_s(p, 24);
-                bcx.ins().call(puts_ref, &[data]);
+                let call = bcx.ins().call(show_ref, &[p]);
+                let s = bcx.inst_results(call)[0];
+                let len = bcx.ins().load(types::I64, MemFlagsData::new(), s, 16);
+                let data = bcx.ins().iadd_imm_s(s, 24);
+                let one = bcx.ins().iconst(types::I64, 1);
+                bcx.ins().call(write_ref, &[one, data, len]);
+                let nl = bcx.ins().symbol_value(types::I64, s_nl_gv);
+                bcx.ins().call(write_ref, &[one, nl, one]);
+                bcx.ins().call(release_ref, &[s]);
                 bcx.ins().return_(&[]);
                 bcx.seal_all_blocks();
                 bcx.finalize(target_config);
@@ -745,8 +865,8 @@ impl Compiler {
                 .map_err(|e| format!("define quill_println: {e}"))?;
         }
 
-        // quill_print(s) — write the string's bytes to stdout (no newline),
-        // so `.` output appears as it is produced.
+        // quill_print(v) — format any value structurally and write its bytes
+        // to stdout (no newline), so `.` output appears as it is produced.
         {
             let target_config = self.module.target_config();
             let mut sig = Signature::new(CallConv::SystemV);
@@ -759,6 +879,8 @@ impl Compiler {
             ctx.func.name = UserFuncName::testcase("quill_print");
             ctx.func.signature = sig;
             let write_ref = self.module.declare_func_in_func(write_import, &mut ctx.func);
+            let show_ref = self.declare_rt_in(&mut ctx, "quill_show", &plain_sig(1));
+            let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
             {
                 let mut fctx = FunctionBuilderContext::new();
                 let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -766,24 +888,13 @@ impl Compiler {
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
                 let p = bcx.block_params(block)[0];
-                // Trap on non-strings, like quill_println.
-                let tag = bcx.ins().load(types::I64, MemFlagsData::new(), p, 8);
-                let str_tag = bcx.ins().iconst(types::I64, TAG_STR);
-                let is_str = bcx.ins().icmp(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    tag,
-                    str_tag,
-                );
-                let ok = bcx.create_block();
-                let bad = bcx.create_block();
-                bcx.ins().brif(is_str, ok, &[], bad, &[]);
-                bcx.switch_to_block(bad);
-                bcx.ins().trap(TrapCode::unwrap_user(3));
-                bcx.switch_to_block(ok);
-                let len = bcx.ins().load(types::I64, MemFlagsData::new(), p, 16);
-                let data = bcx.ins().iadd_imm_s(p, 24);
+                let call = bcx.ins().call(show_ref, &[p]);
+                let s = bcx.inst_results(call)[0];
+                let len = bcx.ins().load(types::I64, MemFlagsData::new(), s, 16);
+                let data = bcx.ins().iadd_imm_s(s, 24);
                 let one = bcx.ins().iconst(types::I64, 1);
                 bcx.ins().call(write_ref, &[one, data, len]);
+                bcx.ins().call(release_ref, &[s]);
                 bcx.ins().return_(&[]);
                 bcx.seal_all_blocks();
                 bcx.finalize(target_config);
@@ -1137,9 +1248,16 @@ impl Compiler {
                     tag,
                     char_tag,
                 );
+                let unit_tag = bcx.ins().iconst(types::I64, TAG_UNIT);
+                let is_unit = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    tag,
+                    unit_tag,
+                );
                 let is_num = bcx.ins().bor(is_int, is_bool);
                 let is_num = bcx.ins().bor(is_num, is_float);
                 let is_num = bcx.ins().bor(is_num, is_char);
+                let is_num = bcx.ins().bor(is_num, is_unit);
                 let is_scalar = bcx.ins().bor(is_num, is_str);
                 let release_fields = bcx.create_block();
                 let just_free = bcx.create_block();
@@ -1216,6 +1334,7 @@ impl Compiler {
 
         let s_true_id = self.declare_bytes("quill_s_true", b"true\0");
         let s_false_id = self.declare_bytes("quill_s_false", b"false\0");
+        let s_unit_id = self.declare_bytes("quill_s_unit", b"()\0");
         let s_open_id = self.declare_bytes("quill_s_open", b"[\0");
         let s_paren_id = self.declare_bytes("quill_s_paren", b"(\0");
         let s_closep_id = self.declare_bytes("quill_s_closep", b")\0");
@@ -1320,7 +1439,75 @@ impl Compiler {
                 .map_err(|e| format!("define quill_str_cstr: {e}"))?;
         }
 
-        // quill_char_str(byte) -> str — a one-character string box.
+        // quill_read_line() -> str box, or 0 at end of input. The raw C
+        // helper returns a malloc'd NUL-terminated line (NULL at EOF) plus
+        // its length in a separate call — the length, not strlen, is used so
+        // embedded NUL bytes are preserved, matching the interpreter.
+        {
+            let target_config = self.module.target_config();
+            let sig = plain_sig(0);
+            let id = self
+                .module
+                .declare_function("quill_read_line", Linkage::Local, &sig)
+                .map_err(|e| format!("declare quill_read_line: {e}"))?;
+            let mut ctx = self.module.make_context();
+            ctx.func.name = UserFuncName::testcase("quill_read_line");
+            ctx.func.signature = sig;
+            let raw_ref = self.module.declare_func_in_func(read_line_raw, &mut ctx.func);
+            let len_ref = self.module.declare_func_in_func(read_line_len, &mut ctx.func);
+            let free_ref = self.module.declare_func_in_func(free, &mut ctx.func);
+            let from_bytes_ref =
+                self.declare_rt_in(&mut ctx, "quill_str_from_bytes", &plain_sig(2));
+            {
+                let mut fctx = FunctionBuilderContext::new();
+                let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+                let block = bcx.create_block();
+                bcx.switch_to_block(block);
+                let call = bcx.ins().call(raw_ref, &[]);
+                let ptr = bcx.inst_results(call)[0];
+                let zero = bcx.ins().iconst(types::I64, 0);
+                let is_null = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    ptr,
+                    zero,
+                );
+                let eof_b = bcx.create_block();
+                let not_eof_b = bcx.create_block();
+                bcx.ins().brif(is_null, eof_b, &[], not_eof_b, &[]);
+                bcx.switch_to_block(eof_b);
+                bcx.ins().return_(&[zero]);
+                // A read error (e.g. stdin closed) returns the -1 sentinel;
+                // trap like the `error` builtin, mirroring the interpreter's
+                // readLine failure.
+                bcx.switch_to_block(not_eof_b);
+                let minus_one = bcx.ins().iconst(types::I64, -1);
+                let is_err = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    ptr,
+                    minus_one,
+                );
+                let line_b = bcx.create_block();
+                let err_b = bcx.create_block();
+                bcx.ins().brif(is_err, err_b, &[], line_b, &[]);
+                bcx.switch_to_block(err_b);
+                bcx.ins().trap(TrapCode::unwrap_user(2));
+                bcx.switch_to_block(line_b);
+                let call2 = bcx.ins().call(len_ref, &[]);
+                let len = bcx.inst_results(call2)[0];
+                let call3 = bcx.ins().call(from_bytes_ref, &[ptr, len]);
+                let boxed = bcx.inst_results(call3)[0];
+                bcx.ins().call(free_ref, &[ptr]);
+                bcx.ins().return_(&[boxed]);
+                bcx.seal_all_blocks();
+                bcx.finalize(target_config);
+            }
+            self.module
+                .define_function(id, &mut ctx)
+                .map_err(|e| format!("define quill_read_line: {e}"))?;
+        }
+
+        // quill_char_str(cp) -> str — the UTF-8 encoding of a character's
+        // code point (1-4 bytes), matching the interpreter's Rust `char`.
         {
             let target_config = self.module.target_config();
             let sig = plain_sig(1);
@@ -1338,12 +1525,115 @@ impl Compiler {
                 let block = bcx.create_block();
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
-                let byte = bcx.block_params(block)[0];
+                let cp = bcx.block_params(block)[0];
+
                 let one = bcx.ins().iconst(types::I64, 1);
-                let call = bcx.ins().call(alloc_ref, &[one]);
-                let p = bcx.inst_results(call)[0];
-                bcx.ins().store(MemFlagsData::new(), byte, p, 24);
-                bcx.ins().return_(&[p]);
+                let two = bcx.ins().iconst(types::I64, 2);
+                let three = bcx.ins().iconst(types::I64, 3);
+                let four = bcx.ins().iconst(types::I64, 4);
+                // Constants shared across the width branches.
+                let c1 = bcx.ins().iconst(types::I64, 0x80);
+                let m3f = bcx.ins().iconst(types::I64, 0x3F);
+                let six = bcx.ins().iconst(types::I64, 6);
+                let twelve = bcx.ins().iconst(types::I64, 12);
+                let eighteen = bcx.ins().iconst(types::I64, 18);
+
+                // 1 byte: cp < 0x80.
+                let e0 = bcx.ins().iconst(types::I64, 0x80);
+                let is1 = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+                    cp,
+                    e0,
+                );
+                let w1_b = bcx.create_block();
+                let w_multi = bcx.create_block();
+                bcx.ins().brif(is1, w1_b, &[], w_multi, &[]);
+                bcx.switch_to_block(w1_b);
+                let call1 = bcx.ins().call(alloc_ref, &[one]);
+                let p1 = bcx.inst_results(call1)[0];
+                let b1v = bcx.ins().ireduce(types::I8, cp);
+                bcx.ins().store(MemFlagsData::new(), b1v, p1, 24);
+                bcx.ins().return_(&[p1]);
+
+                // 2 bytes: cp < 0x800.
+                bcx.switch_to_block(w_multi);
+                let e1 = bcx.ins().iconst(types::I64, 0x800);
+                let is2 = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+                    cp,
+                    e1,
+                );
+                let w2_b = bcx.create_block();
+                let w_multi2 = bcx.create_block();
+                bcx.ins().brif(is2, w2_b, &[], w_multi2, &[]);
+                bcx.switch_to_block(w2_b);
+                let call2 = bcx.ins().call(alloc_ref, &[two]);
+                let p2 = bcx.inst_results(call2)[0];
+                let c0 = bcx.ins().iconst(types::I64, 0xC0);
+                let hi_a = bcx.ins().ushr(cp, six);
+                let hi = bcx.ins().bor(c0, hi_a);
+                let lo_a = bcx.ins().band(cp, m3f);
+                let lo = bcx.ins().bor(c1, lo_a);
+                let hi8 = bcx.ins().ireduce(types::I8, hi);
+                let lo8 = bcx.ins().ireduce(types::I8, lo);
+                bcx.ins().store(MemFlagsData::new(), hi8, p2, 24);
+                bcx.ins().store(MemFlagsData::new(), lo8, p2, 25);
+                bcx.ins().return_(&[p2]);
+
+                // 3 bytes: cp < 0x10000.
+                bcx.switch_to_block(w_multi2);
+                let e2 = bcx.ins().iconst(types::I64, 0x10000);
+                let is3 = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+                    cp,
+                    e2,
+                );
+                let w3_b = bcx.create_block();
+                let w4_b = bcx.create_block();
+                bcx.ins().brif(is3, w3_b, &[], w4_b, &[]);
+                bcx.switch_to_block(w3_b);
+                let call3 = bcx.ins().call(alloc_ref, &[three]);
+                let p3 = bcx.inst_results(call3)[0];
+                let e0c = bcx.ins().iconst(types::I64, 0xE0);
+                let b0a = bcx.ins().ushr(cp, twelve);
+                let b0 = bcx.ins().bor(e0c, b0a);
+                let mid_a = bcx.ins().ushr(cp, six);
+                let mid_aa = bcx.ins().band(mid_a, m3f);
+                let mid = bcx.ins().bor(c1, mid_aa);
+                let lo2a = bcx.ins().band(cp, m3f);
+                let lo2v = bcx.ins().bor(c1, lo2a);
+                let b0_8 = bcx.ins().ireduce(types::I8, b0);
+                let mid_8 = bcx.ins().ireduce(types::I8, mid);
+                let lo_8 = bcx.ins().ireduce(types::I8, lo2v);
+                bcx.ins().store(MemFlagsData::new(), b0_8, p3, 24);
+                bcx.ins().store(MemFlagsData::new(), mid_8, p3, 25);
+                bcx.ins().store(MemFlagsData::new(), lo_8, p3, 26);
+                bcx.ins().return_(&[p3]);
+
+                // 4 bytes.
+                bcx.switch_to_block(w4_b);
+                let call4 = bcx.ins().call(alloc_ref, &[four]);
+                let p4 = bcx.inst_results(call4)[0];
+                let f0c = bcx.ins().iconst(types::I64, 0xF0);
+                let b0b = bcx.ins().ushr(cp, eighteen);
+                let b0_4 = bcx.ins().bor(f0c, b0b);
+                let m12_a = bcx.ins().ushr(cp, twelve);
+                let m12_b = bcx.ins().band(m12_a, m3f);
+                let b1_4 = bcx.ins().bor(c1, m12_b);
+                let m6_a = bcx.ins().ushr(cp, six);
+                let m6_b = bcx.ins().band(m6_a, m3f);
+                let b2_4 = bcx.ins().bor(c1, m6_b);
+                let lo4_a = bcx.ins().band(cp, m3f);
+                let b3_4 = bcx.ins().bor(c1, lo4_a);
+                let b0_8b = bcx.ins().ireduce(types::I8, b0_4);
+                let b1_8b = bcx.ins().ireduce(types::I8, b1_4);
+                let b2_8b = bcx.ins().ireduce(types::I8, b2_4);
+                let b3_8b = bcx.ins().ireduce(types::I8, b3_4);
+                bcx.ins().store(MemFlagsData::new(), b0_8b, p4, 24);
+                bcx.ins().store(MemFlagsData::new(), b1_8b, p4, 25);
+                bcx.ins().store(MemFlagsData::new(), b2_8b, p4, 26);
+                bcx.ins().store(MemFlagsData::new(), b3_8b, p4, 27);
+                bcx.ins().return_(&[p4]);
                 bcx.seal_all_blocks();
                 bcx.finalize(target_config);
             }
@@ -1389,6 +1679,46 @@ impl Compiler {
             self.module
                 .define_function(id, &mut ctx)
                 .map_err(|e| format!("define quill_str_tail: {e}"))?;
+        }
+
+        // quill_str_tail_n(s, n) -> str — a fresh box holding s[n..], used
+        // when a string cons pattern consumed more than one byte (UTF-8).
+        {
+            let target_config = self.module.target_config();
+            let sig = plain_sig(2);
+            let id = self
+                .module
+                .declare_function("quill_str_tail_n", Linkage::Local, &sig)
+                .map_err(|e| format!("declare quill_str_tail_n: {e}"))?;
+            let mut ctx = self.module.make_context();
+            ctx.func.name = UserFuncName::testcase("quill_str_tail_n");
+            ctx.func.signature = sig;
+            let alloc_ref = self.declare_rt_in(&mut ctx, "quill_str_alloc", &plain_sig(1));
+            let memcpy_ref = self.module.declare_func_in_func(memcpy, &mut ctx.func);
+            {
+                let mut fctx = FunctionBuilderContext::new();
+                let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+                let block = bcx.create_block();
+                bcx.switch_to_block(block);
+                bcx.append_block_params_for_function_params(block);
+                let s = bcx.block_params(block)[0];
+                let n = bcx.block_params(block)[1];
+                let len = bcx.ins().load(types::I64, MemFlagsData::new(), s, 16);
+                let newlen = bcx.ins().isub(len, n);
+                let call = bcx.ins().call(alloc_ref, &[newlen]);
+                let p = bcx.inst_results(call)[0];
+                let twenty4 = bcx.ins().iconst(types::I64, 24);
+                let dst = bcx.ins().iadd(p, twenty4);
+                let src_off = bcx.ins().iadd(twenty4, n);
+                let src = bcx.ins().iadd(s, src_off);
+                bcx.ins().call(memcpy_ref, &[dst, src, newlen]);
+                bcx.ins().return_(&[p]);
+                bcx.seal_all_blocks();
+                bcx.finalize(target_config);
+            }
+            self.module
+                .define_function(id, &mut ctx)
+                .map_err(|e| format!("define quill_str_tail_n: {e}"))?;
         }
 
         // quill_str_eq(s, bytes, len) -> i64 — does the string box equal the
@@ -1465,7 +1795,7 @@ impl Compiler {
         }
 
         // quill_str_snoc(s, char_box) -> str — a fresh string with the
-        // character appended.
+        // character (UTF-8 encoded, via quill_char_str) appended.
         {
             let target_config = self.module.target_config();
             let sig = plain_sig(2);
@@ -1476,8 +1806,9 @@ impl Compiler {
             let mut ctx = self.module.make_context();
             ctx.func.name = UserFuncName::testcase("quill_str_snoc");
             ctx.func.signature = sig;
-            let alloc_ref = self.declare_rt_in(&mut ctx, "quill_str_alloc", &plain_sig(1));
-            let memcpy_ref = self.module.declare_func_in_func(memcpy, &mut ctx.func);
+            let concat_ref = self.declare_rt_in(&mut ctx, "quill_str_concat", &plain_sig(2));
+            let char_str_ref = self.declare_rt_in(&mut ctx, "quill_char_str", &plain_sig(1));
+            let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
             {
                 let mut fctx = FunctionBuilderContext::new();
                 let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -1485,22 +1816,13 @@ impl Compiler {
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
                 let (s, c) = (bcx.block_params(block)[0], bcx.block_params(block)[1]);
-                let len = bcx.ins().load(types::I64, MemFlagsData::new(), s, 16);
-                let one = bcx.ins().iconst(types::I64, 1);
-                let newlen = bcx.ins().iadd(len, one);
-                let call = bcx.ins().call(alloc_ref, &[newlen]);
-                let p = bcx.inst_results(call)[0];
-                let twenty4 = bcx.ins().iconst(types::I64, 24);
-                let dst = bcx.ins().iadd(p, twenty4);
-                let src = bcx.ins().iadd(s, twenty4);
-                bcx.ins().call(memcpy_ref, &[dst, src, len]);
-                // Store a single byte (an 8-byte word would overrun the box
-                // when the length isn't word-aligned).
-                let byte = bcx.ins().load(types::I8, MemFlagsData::new(), c, 24);
-                let last = bcx.ins().iadd(p, len);
-                let last = bcx.ins().iadd_imm_s(last, 24);
-                bcx.ins().store(MemFlagsData::new(), byte, last, 0);
-                bcx.ins().return_(&[p]);
+                let cp = bcx.ins().load(types::I64, MemFlagsData::new(), c, 24);
+                let cs_call = bcx.ins().call(char_str_ref, &[cp]);
+                let cs = bcx.inst_results(cs_call)[0];
+                let r_call = bcx.ins().call(concat_ref, &[s, cs]);
+                let r = bcx.inst_results(r_call)[0];
+                bcx.ins().call(release_ref, &[cs]);
+                bcx.ins().return_(&[r]);
                 bcx.seal_all_blocks();
                 bcx.finalize(target_config);
             }
@@ -1605,6 +1927,7 @@ impl Compiler {
             let char_str_ref = self.declare_rt_in(&mut ctx, "quill_char_str", &plain_sig(1));
             let s_true_gv = self.module.declare_data_in_func(s_true_id, &mut ctx.func);
             let s_false_gv = self.module.declare_data_in_func(s_false_id, &mut ctx.func);
+            let s_unit_gv = self.module.declare_data_in_func(s_unit_id, &mut ctx.func);
             let s_open_gv = self.module.declare_data_in_func(s_open_id, &mut ctx.func);
             let s_space_gv = self.module.declare_data_in_func(s_space_id, &mut ctx.func);
             let s_nil_gv = self.module.declare_data_in_func(s_nil_id, &mut ctx.func);
@@ -1624,7 +1947,25 @@ impl Compiler {
                 let tag = bcx.ins().load(types::I64, MemFlagsData::new(), p, 8);
                 let payload = bcx.ins().load(types::I64, MemFlagsData::new(), p, 24);
 
+                // Unit -> "()", matching the interpreter's `show`.
+                let unit_tag = bcx.ins().iconst(types::I64, TAG_UNIT);
+                let is_unit = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    tag,
+                    unit_tag,
+                );
+                let unit_b = bcx.create_block();
+                let chk_int = bcx.create_block();
+                bcx.ins().brif(is_unit, unit_b, &[], chk_int, &[]);
+                bcx.switch_to_block(unit_b);
+                let s_unit = bcx.ins().symbol_value(types::I64, s_unit_gv);
+                let two_u = bcx.ins().iconst(types::I64, 2);
+                let cu = bcx.ins().call(from_bytes_ref, &[s_unit, two_u]);
+                let ru = bcx.inst_results(cu)[0];
+                bcx.ins().return_(&[ru]);
+
                 // Int -> itoa.
+                bcx.switch_to_block(chk_int);
                 let int_tag = bcx.ins().iconst(types::I64, TAG_INT);
                 let is_int = bcx.ins().icmp(
                     cranelift_codegen::ir::condcodes::IntCC::Equal,
@@ -2039,7 +2380,14 @@ impl Compiler {
                 tag,
                 bool_tag,
             );
+            let unit_tag = bcx.ins().iconst(types::I64, TAG_UNIT);
+            let is_unit = bcx.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                tag,
+                unit_tag,
+            );
             let is_scalar = bcx.ins().bor(is_int, is_bool);
+            let is_scalar = bcx.ins().bor(is_scalar, is_unit);
             let scalar_b = bcx.create_block();
             let other_b = bcx.create_block();
             let merge_b = bcx.create_block();
@@ -2129,9 +2477,10 @@ impl Compiler {
             make_closure: self.declare_rt_in(&mut ctx, "quill_make_closure", &plain_sig(5)),
             apply: self.declare_rt_in(&mut ctx, "quill_apply", &plain_sig(2)),
             show: self.declare_rt_in(&mut ctx, "quill_show", &plain_sig(1)),
-            str_tail: self.declare_rt_in(&mut ctx, "quill_str_tail", &plain_sig(1)),
+            str_tail_n: self.declare_rt_in(&mut ctx, "quill_str_tail_n", &plain_sig(2)),
             str_eq: self.declare_rt_in(&mut ctx, "quill_str_eq", &plain_sig(3)),
             str_snoc: self.declare_rt_in(&mut ctx, "quill_str_snoc", &plain_sig(2)),
+            read_line: self.declare_rt_in(&mut ctx, "quill_read_line", &plain_sig(0)),
         };
 
         {
@@ -2485,8 +2834,10 @@ impl Compiler {
         let tail = bcx.ins().load(types::I64, MemFlagsData::new(), value, 32);
         bcx.ins().jump(merge_b, &[BlockArg::Value(head), BlockArg::Value(tail)]);
 
-        // String path: the first byte as a Char box and the rest as a fresh
-        // string.
+        // String path: decode the first UTF-8 character (1-4 bytes) — like
+        // the interpreter, which takes the first Rust `char` — and the rest
+        // as a fresh string. Malformed/truncated sequences fall back to a
+        // single byte.
         bcx.switch_to_block(chk_str_b);
         let str_tag = bcx.ins().iconst(types::I64, TAG_STR);
         let is_str = bcx.ins().icmp(
@@ -2507,10 +2858,160 @@ impl Compiler {
         let nonempty_b = bcx.create_block();
         bcx.ins().brif(nonempty, nonempty_b, &[], next, &[]);
         bcx.switch_to_block(nonempty_b);
-        let byte = bcx.ins().load(types::I8, MemFlagsData::new(), value, 24);
-        let byte64 = bcx.ins().uextend(types::I64, byte);
-        let char_box = box_char(bcx, byte64, rt);
-        let call = bcx.ins().call(rt.str_tail, &[value]);
+
+        let b0 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 24);
+        let b0z = bcx.ins().uextend(types::I64, b0);
+        let one = bcx.ins().iconst(types::I64, 1);
+        // Constants shared by the multi-byte branches below (they must be
+        // defined before the branch so they dominate every user).
+        let lo2 = bcx.ins().iconst(types::I64, 0x3F);
+        let six = bcx.ins().iconst(types::I64, 6);
+        let twelve = bcx.ins().iconst(types::I64, 12);
+
+        // Head block: (codepoint, consumed bytes) -> char box + tail.
+        let head_b = bcx.create_block();
+        let cp_param = bcx.append_block_param(head_b, types::I64);
+        let n_param = bcx.append_block_param(head_b, types::I64);
+
+        // ASCII: 0xxxxxxx.
+        let ascii_lim = bcx.ins().iconst(types::I64, 0x80);
+        let is_ascii = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+            b0z,
+            ascii_lim,
+        );
+        let one_b = bcx.create_block();
+        let multi_b = bcx.create_block();
+        bcx.ins().brif(is_ascii, one_b, &[], multi_b, &[]);
+        bcx.switch_to_block(one_b);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+
+        // 2-byte lead: 110xxxxx.
+        bcx.switch_to_block(multi_b);
+        let lead2_mask = bcx.ins().iconst(types::I64, 0xE0);
+        let lead2_val = bcx.ins().iconst(types::I64, 0xC0);
+        let b02 = bcx.ins().band(b0z, lead2_mask);
+        let is2 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            b02,
+            lead2_val,
+        );
+        let two_b = bcx.create_block();
+        let three_chk = bcx.create_block();
+        bcx.ins().brif(is2, two_b, &[], three_chk, &[]);
+        bcx.switch_to_block(two_b);
+        let two = bcx.ins().iconst(types::I64, 2);
+        let len2 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+            slen,
+            two,
+        );
+        let two_ok = bcx.create_block();
+        let fb2 = bcx.create_block();
+        bcx.ins().brif(len2, two_ok, &[], fb2, &[]);
+        bcx.switch_to_block(two_ok);
+        let b1 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 25);
+        let b1z = bcx.ins().uextend(types::I64, b1);
+        let lo1 = bcx.ins().iconst(types::I64, 0x1F);
+        let hi_a = bcx.ins().band(b0z, lo1);
+        let hi = bcx.ins().ishl(hi_a, six);
+        let lo_b = bcx.ins().band(b1z, lo2);
+        let cp2 = bcx.ins().bor(hi, lo_b);
+        bcx.ins().jump(head_b, &[BlockArg::Value(cp2), BlockArg::Value(two)]);
+        bcx.switch_to_block(fb2);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+
+        // 3-byte lead: 1110xxxx.
+        bcx.switch_to_block(three_chk);
+        let lead3_mask = bcx.ins().iconst(types::I64, 0xF0);
+        let lead3_val = bcx.ins().iconst(types::I64, 0xE0);
+        let b03 = bcx.ins().band(b0z, lead3_mask);
+        let is3 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            b03,
+            lead3_val,
+        );
+        let three_b = bcx.create_block();
+        let four_chk = bcx.create_block();
+        bcx.ins().brif(is3, three_b, &[], four_chk, &[]);
+        bcx.switch_to_block(three_b);
+        let three = bcx.ins().iconst(types::I64, 3);
+        let len3 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+            slen,
+            three,
+        );
+        let three_ok = bcx.create_block();
+        let fb3 = bcx.create_block();
+        bcx.ins().brif(len3, three_ok, &[], fb3, &[]);
+        bcx.switch_to_block(three_ok);
+        let c1 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 25);
+        let c1z = bcx.ins().uextend(types::I64, c1);
+        let c2 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 26);
+        let c2z = bcx.ins().uextend(types::I64, c2);
+        let lo3 = bcx.ins().iconst(types::I64, 0x0F);
+        let hi3a = bcx.ins().band(b0z, lo3);
+        let hi3 = bcx.ins().ishl(hi3a, twelve);
+        let mid3a = bcx.ins().band(c1z, lo2);
+        let mid3 = bcx.ins().ishl(mid3a, six);
+        let lo3b = bcx.ins().band(c2z, lo2);
+        let mid3b = bcx.ins().bor(hi3, mid3);
+        let cp3 = bcx.ins().bor(mid3b, lo3b);
+        bcx.ins().jump(head_b, &[BlockArg::Value(cp3), BlockArg::Value(three)]);
+        bcx.switch_to_block(fb3);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+
+        // 4-byte lead: 11110xxx (and anything else is malformed).
+        bcx.switch_to_block(four_chk);
+        let lead4_mask = bcx.ins().iconst(types::I64, 0xF8);
+        let lead4_val = bcx.ins().iconst(types::I64, 0xF0);
+        let b04 = bcx.ins().band(b0z, lead4_mask);
+        let is4 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            b04,
+            lead4_val,
+        );
+        let four_b = bcx.create_block();
+        let fb4 = bcx.create_block();
+        bcx.ins().brif(is4, four_b, &[], fb4, &[]);
+        bcx.switch_to_block(four_b);
+        let four = bcx.ins().iconst(types::I64, 4);
+        let len4 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+            slen,
+            four,
+        );
+        let four_ok = bcx.create_block();
+        let fb4b = bcx.create_block();
+        bcx.ins().brif(len4, four_ok, &[], fb4b, &[]);
+        bcx.switch_to_block(four_ok);
+        let d1 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 25);
+        let d1z = bcx.ins().uextend(types::I64, d1);
+        let d2 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 26);
+        let d2z = bcx.ins().uextend(types::I64, d2);
+        let d3 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 27);
+        let d3z = bcx.ins().uextend(types::I64, d3);
+        let lo4 = bcx.ins().iconst(types::I64, 0x07);
+        let eighteen = bcx.ins().iconst(types::I64, 18);
+        let hi4a = bcx.ins().band(b0z, lo4);
+        let hi4 = bcx.ins().ishl(hi4a, eighteen);
+        let mid4a0 = bcx.ins().band(d1z, lo2);
+        let mid4a = bcx.ins().ishl(mid4a0, twelve);
+        let mid4b0 = bcx.ins().band(d2z, lo2);
+        let mid4b = bcx.ins().ishl(mid4b0, six);
+        let lo4c = bcx.ins().band(d3z, lo2);
+        let hi4b = bcx.ins().bor(hi4, mid4a);
+        let hi4c = bcx.ins().bor(hi4b, mid4b);
+        let cp4 = bcx.ins().bor(hi4c, lo4c);
+        bcx.ins().jump(head_b, &[BlockArg::Value(cp4), BlockArg::Value(four)]);
+        bcx.switch_to_block(fb4b);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+        bcx.switch_to_block(fb4);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+
+        bcx.switch_to_block(head_b);
+        let char_box = box_char(bcx, cp_param, rt);
+        let call = bcx.ins().call(rt.str_tail_n, &[value, n_param]);
         let rest = bcx.inst_results(call)[0];
         bcx.ins().jump(merge_b, &[BlockArg::Value(char_box), BlockArg::Value(rest)]);
 
@@ -2718,9 +3219,9 @@ impl Compiler {
                 Ok(box_char(bcx, code, rt))
             }
             Expr::Unit(_) => {
-                // `()` has no native representation of its own; use a boxed 0.
-                let zero = bcx.ins().iconst(types::I64, 0);
-                Ok(box_int(bcx, zero, rt))
+                // `()` gets its own tag so `show`/`println` print `()`
+                // rather than `0`, matching the interpreter.
+                Ok(box_unit(bcx, rt))
             }
             // Under immutability + ARC, `clone`, `&`, and `*` are identities.
             Expr::Clone(e, _) | Expr::Borrow { expr: e, .. } | Expr::Deref(e, _) => {
@@ -2816,7 +3317,7 @@ impl Compiler {
                 let call = bcx.ins().call(rt.alloc, &[tag, nfields]);
                 Ok(bcx.inst_results(call)[0])
             }
-            Expr::Var(name, _) if name == "otherwise" => {
+            Expr::Var(name, _) if name == "otherwise" && !vars.contains_key(name) => {
                 // `otherwise` is the predefined constant `True` (used in guards).
                 let one = bcx.ins().iconst(types::I64, 1);
                 Ok(box_bool(bcx, one, rt))
@@ -2846,6 +3347,16 @@ impl Compiler {
                         let nil = make_nil(bcx, rt);
                         Ok(make_closure(bcx, arity, func_ref, nil, rt))
                     }
+                } else if let Some(synth) = self.builtin_values.get(name) {
+                    // A builtin used as a value: materialize its wrapper
+                    // function as a closure, like the interpreter's prelude.
+                    let func_ref = funcrefs
+                        .get(synth)
+                        .copied()
+                        .ok_or_else(|| format!("unbound `{name}`"))?;
+                    let arity = self.arities.get(synth).copied().unwrap_or(0);
+                    let nil = make_nil(bcx, rt);
+                    Ok(make_closure(bcx, arity, func_ref, nil, rt))
                 } else {
                     Err(format!("unbound `{name}`"))
                 }
@@ -3204,7 +3715,10 @@ impl Compiler {
         };
 
         if let Some(name) = head_name.as_deref() {
-            if is_builtin(name) {
+            // A top-level function definition or a local binding shadows a
+            // builtin of the same name — the interpreter resolves them the
+            // same way — so the builtin is only used when neither exists.
+            if is_builtin(name) && !funcrefs.contains_key(name) && !vars.contains_key(name) {
                 return self.gen_builtin(bcx, name, &args, vars, funcrefs, rt, cells, None);
             }
 
@@ -3585,14 +4099,12 @@ impl Compiler {
             "println" => {
                 bcx.ins().call(rt.println, &[vals[0]]);
                 release(bcx, rt, vals[0]);
-                let zero = bcx.ins().iconst(types::I64, 0);
-                Ok(box_int(bcx, zero, rt))
+                Ok(box_unit(bcx, rt))
             }
             "print" => {
                 bcx.ins().call(rt.print, &[vals[0]]);
                 release(bcx, rt, vals[0]);
-                let zero = bcx.ins().iconst(types::I64, 0);
-                Ok(box_int(bcx, zero, rt))
+                Ok(box_unit(bcx, rt))
             }
             "show" => {
                 let call = bcx.ins().call(rt.show, &[vals[0]]);
@@ -3627,6 +4139,109 @@ impl Compiler {
                 bcx.switch_to_block(merge_b);
                 release(bcx, rt, vals[0]);
                 Ok(box_char(bcx, merge_param, rt))
+            }
+            "ord" => {
+                // Character (its unboxed code point) to Int.
+                let c = unbox(bcx, vals[0]);
+                release(bcx, rt, vals[0]);
+                Ok(box_int(bcx, c, rt))
+            }
+            "floor" | "ceil" => {
+                let f = unbox_float(bcx, vals[0]);
+                let r = if op == "floor" {
+                    bcx.ins().floor(f)
+                } else {
+                    bcx.ins().ceil(f)
+                };
+                let i = bcx.ins().fcvt_to_sint_sat(types::I64, r);
+                release(bcx, rt, vals[0]);
+                Ok(box_int(bcx, i, rt))
+            }
+            "sqrt" => {
+                // Like the interpreter's `sqrt`, accept Int (promoting to
+                // Float) and Float.
+                let tag = tag_of(bcx, vals[0]);
+                let int_tag = bcx.ins().iconst(types::I64, TAG_INT);
+                let is_int = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    tag,
+                    int_tag,
+                );
+                let int_block = bcx.create_block();
+                let float_block = bcx.create_block();
+                let merge_block = bcx.create_block();
+                let merge_param = bcx.append_block_param(merge_block, types::I64);
+                bcx.ins().brif(is_int, int_block, &[], float_block, &[]);
+                bcx.switch_to_block(int_block);
+                let i = unbox(bcx, vals[0]);
+                let f = bcx.ins().fcvt_from_sint(types::F64, i);
+                let fr = bcx.ins().sqrt(f);
+                let boxed = box_float(bcx, fr, rt);
+                bcx.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+                bcx.switch_to_block(float_block);
+                let f2 = unbox_float(bcx, vals[0]);
+                let fr2 = bcx.ins().sqrt(f2);
+                let boxed2 = box_float(bcx, fr2, rt);
+                bcx.ins().jump(merge_block, &[BlockArg::Value(boxed2)]);
+                bcx.seal_block(int_block);
+                bcx.seal_block(float_block);
+                bcx.seal_block(merge_block);
+                bcx.switch_to_block(merge_block);
+                release(bcx, rt, vals[0]);
+                Ok(merge_param)
+            }
+            "_readLine" | "Std.IO._readLine" => {
+                // Internal for Std.IO: `None` at end of input, `Some line`
+                // otherwise. Std.IO imports Std.Option, so the constructors
+                // are always in the program when this is reached. (The
+                // qualified form is what Std.IO's call site becomes after
+                // module flattening; source code can only ever reach the
+                // unqualified one if a user defines it, which is handled by
+                // the shadowing checks in gen_apply.)
+                let none_idx = self
+                    .info
+                    .ctor_of("Std.Option.None")
+                    .ok_or_else(|| "`_readLine` requires Std.Option (import Std.IO)".to_string())?;
+                let some_idx = self
+                    .info
+                    .ctor_of("Std.Option.Some")
+                    .ok_or_else(|| "`_readLine` requires Std.Option (import Std.IO)".to_string())?;
+                // The `()` argument is a freshly boxed unit; the intrinsic
+                // does not use it, so release it like the other builtins do.
+                release(bcx, rt, vals[0]);
+                let call = bcx.ins().call(rt.read_line, &[]);
+                let s = bcx.inst_results(call)[0];
+                let zero = bcx.ins().iconst(types::I64, 0);
+                let is_null = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    s,
+                    zero,
+                );
+                let none_b = bcx.create_block();
+                let some_b = bcx.create_block();
+                let merge_b = bcx.create_block();
+                let merge_param = bcx.append_block_param(merge_b, types::I64);
+                bcx.ins().brif(is_null, none_b, &[], some_b, &[]);
+                bcx.switch_to_block(none_b);
+                let tag0 = bcx.ins().iconst(types::I64, none_idx as i64);
+                let n0 = bcx.ins().iconst(types::I64, 0);
+                let none_call = bcx.ins().call(rt.alloc, &[tag0, n0]);
+                let none_obj = bcx.inst_results(none_call)[0];
+                bcx.ins().jump(merge_b, &[BlockArg::Value(none_obj)]);
+                bcx.switch_to_block(some_b);
+                let tag1 = bcx.ins().iconst(types::I64, some_idx as i64);
+                let n1 = bcx.ins().iconst(types::I64, 1);
+                let some_call = bcx.ins().call(rt.alloc, &[tag1, n1]);
+                let some_obj = bcx.inst_results(some_call)[0];
+                // The string box from quill_read_line becomes the field; the
+                // constructor takes ownership of it.
+                bcx.ins().store(MemFlagsData::new(), s, some_obj, 24);
+                bcx.ins().jump(merge_b, &[BlockArg::Value(some_obj)]);
+                bcx.seal_block(none_b);
+                bcx.seal_block(some_b);
+                bcx.seal_block(merge_b);
+                bcx.switch_to_block(merge_b);
+                Ok(merge_param)
             }
             "snoc" => {
                 let call = bcx.ins().call(rt.str_snoc, &[vals[0], vals[1]]);
@@ -3706,8 +4321,14 @@ fn is_builtin(op: &str) -> bool {
             | "print"
             | "show"
             | "error"
+            | "sqrt"
             | "chr"
+            | "ord"
+            | "floor"
+            | "ceil"
             | "snoc"
+            | "_readLine"
+            | "Std.IO._readLine"
     )
 }
 
@@ -3724,6 +4345,13 @@ fn box_int(bcx: &mut FunctionBuilder, v: Value, rt: Rt) -> Value {
 
 fn box_bool(bcx: &mut FunctionBuilder, v: Value, rt: Rt) -> Value {
     box_value(bcx, TAG_BOOL, v, rt)
+}
+
+/// Box the unit value `()` (payload unused) as a `TAG_UNIT` box so `show`
+/// can distinguish it from the integer 0.
+fn box_unit(bcx: &mut FunctionBuilder, rt: Rt) -> Value {
+    let zero = bcx.ins().iconst(types::I64, 0);
+    box_value(bcx, TAG_UNIT, zero, rt)
 }
 
 /// Box a character's byte value as a `TAG_CHAR` box.
@@ -3849,47 +4477,66 @@ fn build_args_list(bcx: &mut FunctionBuilder, arg_vals: &[Value], rt: Rt) -> Val
 /// ones), as `(span.lo, params, body, span)`.
 fn collect_lambdas(
     expr: &Expr,
-    out: &mut Vec<(usize, Vec<Pattern>, Box<Expr>, crate::error::Span)>,
+    bound: &mut std::collections::HashSet<String>,
+    out: &mut Vec<(
+        usize,
+        Vec<Pattern>,
+        Box<Expr>,
+        crate::error::Span,
+        std::collections::HashSet<String>,
+    )>,
 ) {
     match expr {
         Expr::Lambda(params, body, span) => {
-            out.push((span.lo, params.clone(), body.clone(), *span));
-            collect_lambdas(body, out);
+            out.push((span.lo, params.clone(), body.clone(), *span, bound.clone()));
+            let mut nb = bound.clone();
+            for p in params {
+                pat_vars(p, &mut nb);
+            }
+            collect_lambdas(body, &mut nb, out);
         }
         Expr::App(f, a, _) => {
-            collect_lambdas(f, out);
-            collect_lambdas(a, out);
+            collect_lambdas(f, bound, out);
+            collect_lambdas(a, bound, out);
         }
         Expr::Let(bindings, body, _) => {
             for b in bindings {
-                collect_lambdas(&b.expr, out);
+                collect_lambdas(&b.expr, bound, out);
             }
-            collect_lambdas(body, out);
+            let mut nb = bound.clone();
+            for b in bindings {
+                if let Some(n) = b.name() {
+                    nb.insert(n.to_string());
+                }
+            }
+            collect_lambdas(body, &mut nb, out);
         }
         Expr::If(c, t, e, _) => {
-            collect_lambdas(c, out);
-            collect_lambdas(t, out);
-            collect_lambdas(e, out);
+            collect_lambdas(c, bound, out);
+            collect_lambdas(t, bound, out);
+            collect_lambdas(e, bound, out);
         }
         Expr::Case(s, alts, _) => {
-            collect_lambdas(s, out);
+            collect_lambdas(s, bound, out);
             for alt in alts {
-                collect_lambdas(&alt.body, out);
+                let mut nb = bound.clone();
+                pat_vars(&alt.pat, &mut nb);
+                collect_lambdas(&alt.body, &mut nb, out);
             }
         }
-        Expr::Ascribe(e, _, _) => collect_lambdas(e, out),
+        Expr::Ascribe(e, _, _) => collect_lambdas(e, bound, out),
         Expr::Tuple(es, _) | Expr::List(es, _) => {
             for e in es {
-                collect_lambdas(e, out);
+                collect_lambdas(e, bound, out);
             }
         }
         Expr::Borrow { expr, .. }
         | Expr::Deref(expr, _)
         | Expr::Clone(expr, _)
-        | Expr::Field(expr, _, _) => collect_lambdas(expr, out),
+        | Expr::Field(expr, _, _) => collect_lambdas(expr, bound, out),
         Expr::Record { fields, .. } => {
             for (_, e) in fields {
-                collect_lambdas(e, out);
+                collect_lambdas(e, bound, out);
             }
         }
         _ => {}

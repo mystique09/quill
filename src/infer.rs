@@ -59,6 +59,7 @@ pub struct TypeInfo {
 pub fn infer_program(program: &Program) -> Result<TypeInfo, Vec<Diagnostic>> {
     let mut inf = Infer::new();
     inf.collect(program);
+    inf.install_stdlib_prelude();
     inf.check(program);
     if inf.errors.is_empty() {
         Ok(inf.type_info())
@@ -712,6 +713,9 @@ impl Infer {
         prelude.push(("print".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::unit()) }));
         prelude.push(("sqrt".into(), Scheme::mono(Ty::func(Ty::float(), Ty::float()))));
         prelude.push(("chr".into(), Scheme::mono(Ty::func(Ty::int(), Ty::char()))));
+        prelude.push(("ord".into(), Scheme::mono(Ty::func(Ty::char(), Ty::int()))));
+        prelude.push(("floor".into(), Scheme::mono(Ty::func(Ty::float(), Ty::int()))));
+        prelude.push(("ceil".into(), Scheme::mono(Ty::func(Ty::float(), Ty::int()))));
         prelude.push(("snoc".into(), Scheme::mono(Ty::func(Ty::string(), Ty::func(Ty::char(), Ty::string())))));
         let a = self.new_var();
         prelude.push(("error".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::string(), Ty::Var(a)) }));
@@ -719,6 +723,22 @@ impl Infer {
 
         for (name, scheme) in prelude {
             self.insert_local(&name, scheme);
+        }
+    }
+
+    /// Install builtins whose types name stdlib types, which exist only
+    /// after `collect` has registered the program's data types. `Std.IO`'s
+    /// `_readLine` intrinsic is bound under its module-qualified flat name —
+    /// which source identifiers cannot spell, so user definitions can never
+    /// shadow it — and only when `Std.Option` is loaded, which is exactly
+    /// when `Std.IO` (the only module that references the intrinsic) is.
+    fn install_stdlib_prelude(&mut self) {
+        if let Some(&adt_id) = self.adt_ids.get("Std.Option.Option") {
+            let option_string = Ty::Con(TyCon::Adt(adt_id), vec![Ty::string()]);
+            self.insert_local(
+                "Std.IO._readLine",
+                Scheme::mono(Ty::func(Ty::unit(), option_string)),
+            );
         }
     }
 

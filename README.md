@@ -13,7 +13,7 @@ that make Rust great:
 - **A module system** — multi-file programs with `use`, qualified imports, and
   export lists.
 - **A standard library written in Quill itself** — `Std.List`, `Std.Option`,
-  `Std.Result`, `Std.Function`.
+  `Std.Result`, `Std.Function`, `Std.String`, `Std.Tuple`, `Std.Math`, `Std.IO`.
 - **Immutability by default** — like Rust, bindings are immutable unless declared `mut`,
   with `&`/`&mut` borrows. Memory is managed by automatic reference counting.
 - **No `null`** — use `Option` and `Result` instead.
@@ -22,14 +22,21 @@ Quill is a tree-walking interpreter with a native compiler backend (Cranelift).
 The interpreter runs `.q` files or a REPL; `quill build` compiles a program to a
 native executable.
 
+> **Interpreter vs. native compiler.** `cargo run -- file.q` executes on the
+> tree-walking interpreter; `cargo run -- build file.q` compiles the same
+> program to a native executable. They run the *same language*, but they are
+> different engines: the interpreter is handy for development, while native
+> builds are much faster and stream `print` output immediately (the
+> interpreter buffers it).
+
 ## Quick start
 
 ```console
-$ cargo run -- examples/hello.q
+$ cargo run -- examples/hello.q                          # the interpreter
 Hello, world!
 
-$ cargo run -- build examples/native.q quill-native   # native binary
-$ ./quill-native                                      # exit code 123
+$ cargo run -- build examples/native.q quill-native      # the native compiler
+$ ./quill-native                                         # exit code 123
 $ cargo run              # start the REPL
 ```
 
@@ -70,8 +77,13 @@ Run the examples:
 $ cargo run -- examples/hello.q
 $ cargo run -- examples/recursion.q
 $ cargo run -- examples/stdlib.q
+$ cargo run -- examples/strings.q       # Std.String / Std.Tuple / Std.Math
+$ echo "hi" | cargo run -- examples/io.q   # Std.IO reads stdin
 $ cargo run -- examples/modules/Main.q    # multi-file program
-$ cargo run -- examples/brainfuck/Main.q # a Brainfuck interpreter, in Quill
+$ cargo run -- build examples/brainfuck/Main.q quill-bf   # Brainfuck interpreter, in Quill
+$ ./quill-bf                                          # renders Mandelbrot, streamed
+# NB: the checked-in main renders Mandelbrot, which is slow and memory-hungry
+# in the *interpreter* — compile it natively (above) instead of `cargo run`.
 ```
 
 See [docs/LANGUAGE.md](docs/LANGUAGE.md) for the full language reference.

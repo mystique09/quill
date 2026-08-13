@@ -47,6 +47,10 @@ impl Loader {
         embedded.insert("Std/Option.q".to_string(), include_str!("../stdlib/Option.q"));
         embedded.insert("Std/Result.q".to_string(), include_str!("../stdlib/Result.q"));
         embedded.insert("Std/Function.q".to_string(), include_str!("../stdlib/Function.q"));
+        embedded.insert("Std/String.q".to_string(), include_str!("../stdlib/String.q"));
+        embedded.insert("Std/Tuple.q".to_string(), include_str!("../stdlib/Tuple.q"));
+        embedded.insert("Std/Math.q".to_string(), include_str!("../stdlib/Math.q"));
+        embedded.insert("Std/IO.q".to_string(), include_str!("../stdlib/IO.q"));
         Loader {
             search_paths: vec![PathBuf::from(".")],
             embedded,
