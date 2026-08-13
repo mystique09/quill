@@ -960,6 +960,8 @@ impl Compiler {
                 let r = bcx.inst_results(call2)[0];
                 bcx.ins().return_(&[r]);
                 bcx.switch_to_block(partial_block);
+                // The new closure shares `env`, so retain it before storing.
+                bcx.ins().call(retain_ref, &[env]);
                 let call3 = bcx
                     .ins()
                     .call(make_ref, &[arity, nargs2, code_ptr, new_list, env]);
@@ -1099,7 +1101,9 @@ impl Compiler {
                 bcx.ins().brif(is_fun, fun_block, &[], not_fun, &[]);
                 bcx.switch_to_block(fun_block);
                 let args_list = bcx.ins().load(types::I64, MemFlagsData::new(), p, 48);
+                let env = bcx.ins().load(types::I64, MemFlagsData::new(), p, 56);
                 bcx.ins().call(release_ref, &[args_list]);
+                bcx.ins().call(release_ref, &[env]);
                 bcx.ins().jump(just_free, &[]);
                 bcx.switch_to_block(not_fun);
                 bcx.ins().brif(is_scalar, just_free, &[], release_fields, &[]);
@@ -1950,6 +1954,7 @@ impl Compiler {
         ctx.func.signature = sig;
         let callee = self.module.declare_func_in_func(main_id, &mut ctx.func);
         let alloc_ref = self.declare_rt_in(&mut ctx, "quill_alloc", &plain_sig(2));
+        let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
         {
             let mut func_ctx = FunctionBuilderContext::new();
             let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
@@ -2200,7 +2205,6 @@ impl Compiler {
                                     &mut bcx, ap, field_val, &mut vars, &mut owned, next_block, rt,
                                 )?;
                             }
-                            // The matched object itself is consumed.
                             owned.push(obj);
                         }
                         Pattern::List(ps, _) if ps.is_empty() => {
@@ -2322,6 +2326,12 @@ impl Compiler {
                 }
 
                 let self_ref = funcrefs[&f.name];
+                // A self-call in tail position jumps here with (closure,
+                // args list); the pattern-bound originals are released once
+                // the arguments are safely evaluated, then we tail-jump.
+                let tail_b = bcx.create_block();
+                let tail_nil = bcx.append_block_param(tail_b, types::I64);
+                let tail_list = bcx.append_block_param(tail_b, types::I64);
                 let body = self.gen_expr(
                     &mut bcx,
                     &clause.body,
@@ -2329,7 +2339,7 @@ impl Compiler {
                     &funcrefs,
                     rt,
                     cell_vars,
-                    Some((&f.name, arity, self_ref)),
+                    Some((&f.name, arity, self_ref, tail_b)),
                 )?;
 
                 for val in &owned {
@@ -2338,6 +2348,16 @@ impl Compiler {
 
                 bcx.ins().jump(merge_block, &[BlockArg::Value(body)]);
                 bcx.seal_block(this_block);
+
+                bcx.switch_to_block(tail_b);
+                for val in &owned {
+                    release(&mut bcx, rt, *val);
+                }
+                // The caller-provided nil closure is never read by a
+                // top-level function; release it before the tail jump.
+                bcx.ins().call(rt.release, &[tail_nil]);
+                bcx.ins().return_call(self_ref, &[tail_nil, tail_list]);
+                bcx.seal_block(tail_b);
             }
 
             bcx.switch_to_block(trap_block);
@@ -2443,6 +2463,7 @@ impl Compiler {
         bcx.switch_to_block(merge_b);
         self.bind_pattern(bcx, h, hparam, vars, owned, next, rt)?;
         self.bind_pattern(bcx, t, tparam, vars, owned, next, rt)?;
+        // The matched cons cell / string's working ref is released at exit.
         owned.push(value);
         Ok(())
     }
@@ -2624,7 +2645,7 @@ impl Compiler {
         funcrefs: &HashMap<String, FuncRef>,
         rt: Rt,
         cells: &std::collections::HashSet<String>,
-        tail: Option<(&str, usize, FuncRef)>,
+        tail: Option<(&str, usize, FuncRef, cranelift_codegen::ir::Block)>,
     ) -> Result<Value, String> {
         match e {
             Expr::Int(n, _) => {
@@ -2901,7 +2922,7 @@ impl Compiler {
         funcrefs: &HashMap<String, FuncRef>,
         rt: Rt,
         cells: &std::collections::HashSet<String>,
-        tail: Option<(&str, usize, FuncRef)>,
+        tail: Option<(&str, usize, FuncRef, cranelift_codegen::ir::Block)>,
     ) -> Result<Value, String> {
         let sv = self.gen_expr(bcx, scrut, vars, funcrefs, rt, cells, None)?;
         let merge = bcx.create_block();
@@ -3103,7 +3124,7 @@ impl Compiler {
         funcrefs: &HashMap<String, FuncRef>,
         rt: Rt,
         cells: &std::collections::HashSet<String>,
-        tail: Option<(&str, usize, FuncRef)>,
+        tail: Option<(&str, usize, FuncRef, cranelift_codegen::ir::Block)>,
     ) -> Result<Value, String> {
         let mut args: Vec<Expr> = Vec::new();
         let mut head = e.clone();
@@ -3156,6 +3177,7 @@ impl Compiler {
                     let nil = make_nil(bcx, rt);
                     let call0 = bcx.ins().call(callee, &[nil, nil]);
                     let mut closure = bcx.inst_results(call0)[0];
+                    release(bcx, rt, nil);
                     for a in &args {
                         let av = self.gen_expr(bcx, a, vars, funcrefs, rt, cells, None)?;
                         let call = bcx.ins().call(rt.apply, &[closure, av]);
@@ -3169,18 +3191,22 @@ impl Compiler {
                 for a in &args {
                     arg_vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells, None)?);
                 }
-                if let Some((self_name, self_arity, self_ref)) = tail {
+                if let Some((self_name, self_arity, _self_ref, tail_block)) = tail {
                     if name == self_name && args.len() == self_arity {
                         // A self-recursive call in tail position: jump to
-                        // ourselves instead of calling, so deep recursion
-                        // runs in constant stack.
+                        // the clause's tail block (which releases the
+                        // pattern-bound originals and then tail-jumps),
+                        // so deep recursion runs in constant stack.
                         let list = build_args_list(bcx, &arg_vals, rt);
                         let nil = make_nil(bcx, rt);
-                        bcx.ins().return_call(self_ref, &[nil, list]);
+                        let tb = bcx
+                            .ins()
+                            .jump(tail_block, &[BlockArg::Value(nil), BlockArg::Value(list)]);
+                        let _ = tb;
                         let dead = bcx.create_block();
                         bcx.switch_to_block(dead);
                         let zero = bcx.ins().iconst(types::I64, 0);
-                        return Ok(box_int(bcx, zero, rt));
+                        return Ok(zero);
                     }
                 }
                 if args.len() == arity {
@@ -3188,7 +3214,9 @@ impl Compiler {
                     let list = build_args_list(bcx, &arg_vals, rt);
                     let nil = make_nil(bcx, rt);
                     let call = bcx.ins().call(callee, &[nil, list]);
-                    return Ok(bcx.inst_results(call)[0]);
+                    let r = bcx.inst_results(call)[0];
+                    release(bcx, rt, nil);
+                    return Ok(r);
                 }
                 if args.len() < arity {
                     // Partial application: a closure capturing the applied args.
@@ -3208,6 +3236,7 @@ impl Compiler {
                 let nil = make_nil(bcx, rt);
                 let call = bcx.ins().call(callee, &[nil, head_list]);
                 let mut closure = bcx.inst_results(call)[0];
+                release(bcx, rt, nil);
                 for v in &arg_vals[arity..] {
                     let call = bcx.ins().call(rt.apply, &[closure, *v]);
                     let r = bcx.inst_results(call)[0];
@@ -3273,6 +3302,7 @@ impl Compiler {
                     let fid_ref = self.module.declare_func_in_func(*fid, &mut bcx.func);
                     let call = bcx.ins().call(fid_ref, &[nil, list]);
                     let r = bcx.inst_results(call)[0];
+                    release(bcx, rt, nil);
                     bcx.ins().jump(merge, &[BlockArg::Value(r)]);
                     next_b = check_b;
                 }
@@ -3310,7 +3340,7 @@ impl Compiler {
         funcrefs: &HashMap<String, FuncRef>,
         rt: Rt,
         cells: &std::collections::HashSet<String>,
-        _tail: Option<(&str, usize, FuncRef)>,
+        _tail: Option<(&str, usize, FuncRef, cranelift_codegen::ir::Block)>,
     ) -> Result<Value, String> {
         let mut vals = Vec::new();
         for a in args {
