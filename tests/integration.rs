@@ -702,3 +702,51 @@ fn native_builtin_shadowing() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Compiled `println` formats any value structurally (Int, Bool, Char,
+/// lists, tuples) instead of trapping on non-strings — parity with the
+/// interpreter. Skipped when no C compiler is available.
+#[test]
+fn native_println_any_value() {
+    let dir = std::env::temp_dir().join("quill_native_println_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("p.q");
+    std::fs::write(
+        &path,
+        "f x = x + 2\n\
+         main = let _ = println (f 40) in\n\
+         \x20\x20\x20\x20\x20\x20\x20let _ = println True in\n\
+         \x20\x20\x20\x20\x20\x20\x20let _ = println [1, 2] in\n\
+         \x20\x20\x20\x20\x20\x20\x20let _ = println (1, \"a\") in\n\
+         \x20\x20\x20\x20\x20\x20\x20println 'x'\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("p.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("p");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "42\ntrue\n[1, 2]\n(1, a)\n'x'\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

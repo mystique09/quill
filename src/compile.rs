@@ -733,7 +733,8 @@ impl Compiler {
                 .map_err(|e| format!("define quill_str_concat: {e}"))?;
         }
 
-        // quill_println(s) — write the string's bytes and a newline to stdout.
+        // quill_println(v) — format any value structurally (via quill_show)
+        // and write it plus a newline to stdout, like the interpreter.
         {
             let target_config = self.module.target_config();
             let mut sig = Signature::new(CallConv::SystemV);
@@ -746,6 +747,8 @@ impl Compiler {
             ctx.func.name = UserFuncName::testcase("quill_println");
             ctx.func.signature = sig;
             let puts_ref = self.module.declare_func_in_func(puts, &mut ctx.func);
+            let show_ref = self.declare_rt_in(&mut ctx, "quill_show", &plain_sig(1));
+            let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
             {
                 let mut fctx = FunctionBuilderContext::new();
                 let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -753,23 +756,11 @@ impl Compiler {
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
                 let p = bcx.block_params(block)[0];
-                // `println` currently only formats strings; trap on any other
-                // value rather than misreading its payload as a C string.
-                let tag = bcx.ins().load(types::I64, MemFlagsData::new(), p, 8);
-                let str_tag = bcx.ins().iconst(types::I64, TAG_STR);
-                let is_str = bcx.ins().icmp(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    tag,
-                    str_tag,
-                );
-                let ok = bcx.create_block();
-                let bad = bcx.create_block();
-                bcx.ins().brif(is_str, ok, &[], bad, &[]);
-                bcx.switch_to_block(bad);
-                bcx.ins().trap(TrapCode::unwrap_user(3));
-                bcx.switch_to_block(ok);
-                let data = bcx.ins().iadd_imm_s(p, 24);
+                let call = bcx.ins().call(show_ref, &[p]);
+                let s = bcx.inst_results(call)[0];
+                let data = bcx.ins().iadd_imm_s(s, 24);
                 bcx.ins().call(puts_ref, &[data]);
+                bcx.ins().call(release_ref, &[s]);
                 bcx.ins().return_(&[]);
                 bcx.seal_all_blocks();
                 bcx.finalize(target_config);
@@ -779,8 +770,8 @@ impl Compiler {
                 .map_err(|e| format!("define quill_println: {e}"))?;
         }
 
-        // quill_print(s) — write the string's bytes to stdout (no newline),
-        // so `.` output appears as it is produced.
+        // quill_print(v) — format any value structurally and write its bytes
+        // to stdout (no newline), so `.` output appears as it is produced.
         {
             let target_config = self.module.target_config();
             let mut sig = Signature::new(CallConv::SystemV);
@@ -793,6 +784,8 @@ impl Compiler {
             ctx.func.name = UserFuncName::testcase("quill_print");
             ctx.func.signature = sig;
             let write_ref = self.module.declare_func_in_func(write_import, &mut ctx.func);
+            let show_ref = self.declare_rt_in(&mut ctx, "quill_show", &plain_sig(1));
+            let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
             {
                 let mut fctx = FunctionBuilderContext::new();
                 let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -800,24 +793,13 @@ impl Compiler {
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
                 let p = bcx.block_params(block)[0];
-                // Trap on non-strings, like quill_println.
-                let tag = bcx.ins().load(types::I64, MemFlagsData::new(), p, 8);
-                let str_tag = bcx.ins().iconst(types::I64, TAG_STR);
-                let is_str = bcx.ins().icmp(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    tag,
-                    str_tag,
-                );
-                let ok = bcx.create_block();
-                let bad = bcx.create_block();
-                bcx.ins().brif(is_str, ok, &[], bad, &[]);
-                bcx.switch_to_block(bad);
-                bcx.ins().trap(TrapCode::unwrap_user(3));
-                bcx.switch_to_block(ok);
-                let len = bcx.ins().load(types::I64, MemFlagsData::new(), p, 16);
-                let data = bcx.ins().iadd_imm_s(p, 24);
+                let call = bcx.ins().call(show_ref, &[p]);
+                let s = bcx.inst_results(call)[0];
+                let len = bcx.ins().load(types::I64, MemFlagsData::new(), s, 16);
+                let data = bcx.ins().iadd_imm_s(s, 24);
                 let one = bcx.ins().iconst(types::I64, 1);
                 bcx.ins().call(write_ref, &[one, data, len]);
+                bcx.ins().call(release_ref, &[s]);
                 bcx.ins().return_(&[]);
                 bcx.seal_all_blocks();
                 bcx.finalize(target_config);

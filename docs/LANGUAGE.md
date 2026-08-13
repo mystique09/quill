@@ -222,7 +222,8 @@ compiled binaries run fast and stream output. The compiler supports `Int`,
 comparison (with tag-dispatched `Int`/`Float`), `if`, `case` expressions,
 top-level function calls (uncurried), recursion, pattern matching over `Int`,
 `Bool`, `Float`, and algebraic data types (including nested, tuple, record,
-and wildcard patterns), `String` literals with `++` and `println`, lists (list
+and wildcard patterns), `String` literals with `++`, structural `println` and
+`print` of any value, lists (list
 literals, `:` cons, `++` append, and list patterns), tuples, records
 (construction, projection, and patterns), `let`/`where` local bindings
 (including `mut` bindings and `:=`, implemented with shared cells so closures
