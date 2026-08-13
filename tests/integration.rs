@@ -644,3 +644,61 @@ fn native_readline_nul() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn builtin_shadowed_by_user_definition() {
+    // A top-level definition with a builtin's name replaces the prelude
+    // entry in the interpreter (the native half is native_builtin_shadowing).
+    let src = r#"
+_readLine _ = 42
+show _ = 42
+main = println (show (_readLine () + show 1))
+"#;
+    assert_eq!(run_ok(src), "42\n");
+}
+
+/// Compiled programs also let user definitions shadow builtins of the same
+/// name — the result is returned as the exit code (and no stdin is read,
+/// since the user's `_readLine` replaces the intrinsic). Skipped when no C
+/// compiler is available.
+#[test]
+fn native_builtin_shadowing() {
+    let dir = std::env::temp_dir().join("quill_native_shadow_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shadow.q");
+    std::fs::write(
+        &path,
+        "_readLine _ = 40\n\
+         show _ = 2\n\
+         main = _readLine () + show 1\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("shadow.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("shadow");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    // `main` returns the value, which becomes the process exit code: 42
+    // proves both shadowing definitions ran (40 + 2).
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "expected exit code 42, got {:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

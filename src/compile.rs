@@ -3291,7 +3291,11 @@ impl Compiler {
         };
 
         if let Some(name) = head_name.as_deref() {
-            if is_builtin(name) {
+            // A top-level function definition shadows a builtin of the same
+            // name — the interpreter replaces the prelude entry with the
+            // user's function the same way, so the builtin is only used when
+            // no user function exists.
+            if is_builtin(name) && !funcrefs.contains_key(name) {
                 return self.gen_builtin(bcx, name, &args, vars, funcrefs, rt, cells, None);
             }
 
