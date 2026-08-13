@@ -71,6 +71,7 @@ $ cargo run -- examples/hello.q
 $ cargo run -- examples/recursion.q
 $ cargo run -- examples/stdlib.q
 $ cargo run -- examples/modules/Main.q    # multi-file program
+$ cargo run -- examples/brainfuck/Main.q # a Brainfuck interpreter, in Quill
 ```
 
 See [docs/LANGUAGE.md](docs/LANGUAGE.md) for the full language reference.

@@ -419,3 +419,17 @@ fn native_link_and_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn brainfuck_example() {
+    // The Brainfuck interpreter example parses a real Brainfuck string and
+    // prints "Hello World!" (on a large stack, since the interpreter
+    // recurses per step).
+    let src = include_str!("../examples/brainfuck/Main.q");
+    let output = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || run(src))
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(output.unwrap(), "Hello World!\n");
+}
