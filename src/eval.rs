@@ -1164,8 +1164,8 @@ fn install_prelude(global: &mut Scope, info: &ProgramInfo) {
         ("floor", Builtin::Floor),
         ("ceil", Builtin::Ceil),
         ("snoc", Builtin::Snoc),
-        // Internal support for `Std.IO`; typed `() -> a` so `Std.IO` can
-        // give it the concrete `() -> Option String` signature.
+        // Internal support for `Std.IO`; the type checker gives it
+        // `() -> Option String` when `Std.Option` is loaded.
         ("_readLine", Builtin::ReadLine),
     ];
     for (name, b) in builtins {

@@ -59,6 +59,7 @@ pub struct TypeInfo {
 pub fn infer_program(program: &Program) -> Result<TypeInfo, Vec<Diagnostic>> {
     let mut inf = Infer::new();
     inf.collect(program);
+    inf.install_stdlib_prelude();
     inf.check(program);
     if inf.errors.is_empty() {
         Ok(inf.type_info())
@@ -717,15 +718,26 @@ impl Infer {
         prelude.push(("ceil".into(), Scheme::mono(Ty::func(Ty::float(), Ty::int()))));
         prelude.push(("snoc".into(), Scheme::mono(Ty::func(Ty::string(), Ty::func(Ty::char(), Ty::string())))));
         let a = self.new_var();
-        // Native support for `Std.IO.readLine`; the module gives it the
-        // concrete `() -> Option String` type via its own signature.
-        prelude.push(("_readLine".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::unit(), Ty::Var(a)) }));
-        let a = self.new_var();
         prelude.push(("error".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::string(), Ty::Var(a)) }));
         prelude.push(("otherwise".into(), Scheme::mono(Ty::bool())));
 
         for (name, scheme) in prelude {
             self.insert_local(&name, scheme);
+        }
+    }
+
+    /// Install builtins whose types name stdlib types, which exist only
+    /// after `collect` has registered the program's data types. `_readLine`
+    /// gets its true `() -> Option String` type — never an unconstrained
+    /// one — and is only bound when `Std.Option` is actually loaded (it is
+    /// whenever `Std.IO` is, since `Std.IO` imports it).
+    fn install_stdlib_prelude(&mut self) {
+        if let Some(&adt_id) = self.adt_ids.get("Std.Option.Option") {
+            let option_string = Ty::Con(TyCon::Adt(adt_id), vec![Ty::string()]);
+            self.insert_local(
+                "_readLine",
+                Scheme::mono(Ty::func(Ty::unit(), option_string)),
+            );
         }
     }
 
