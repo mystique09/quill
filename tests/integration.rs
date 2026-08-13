@@ -580,3 +580,67 @@ fn native_link_and_run_stdlib() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn readline_intrinsic_is_typed() {
+    // `_readLine` is internal to Std.IO: it is only bound when Std.Option is
+    // loaded, and then with its true `() -> Option String` type — misusing it
+    // must be a type error, never a runtime crash or garbage.
+    let e = run_err("main = println (show (_readLine () + 1))");
+    assert!(e.contains("unbound name"), "got: {e}");
+    let e = run_err("use Std.IO\nmain = println (show (_readLine () + 1))");
+    assert!(e.contains("type mismatch"), "got: {e}");
+}
+
+/// Compiled programs preserve embedded NUL bytes in stdin lines (the C
+/// runtime reports the line length instead of relying on strlen). Observed
+/// through `toChars`, since printing the raw string would stop at the NUL.
+/// Skipped when no C compiler is available.
+#[test]
+fn native_readline_nul() {
+    let dir = std::env::temp_dir().join("quill_native_nul_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nul.q");
+    std::fs::write(
+        &path,
+        "use Std.IO as IO\n\
+         use Std.Option\n\
+         use Std.String as S\n\
+         line :: Option String -> String\n\
+         line None = \"\"\n\
+         line (Some l) = l\n\
+         main = println (show (length (S.toChars (line (IO.readLine ())))))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("nul.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("nul");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let mut child = std::process::Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"a\0b\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
