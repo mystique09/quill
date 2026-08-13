@@ -1051,3 +1051,38 @@ fn native_readline_invalid_utf8_traps() {
     assert_eq!(String::from_utf8_lossy(&output2.stdout), "hé\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Compiled `println` writes the full byte length, so embedded NUL bytes
+/// survive (the interpreter prints them too). Skipped without a C compiler.
+#[test]
+fn native_println_nul() {
+    let dir = std::env::temp_dir().join("quill_native_println_nul_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nul.q");
+    std::fs::write(&path, "main = println \"a\\0b\"\n").unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("nul.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("nul");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"a\0b\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}

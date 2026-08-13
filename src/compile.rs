@@ -207,7 +207,6 @@ struct RtImports {
     malloc: cranelift_module::FuncId,
     free: cranelift_module::FuncId,
     memcpy: cranelift_module::FuncId,
-    puts: cranelift_module::FuncId,
     strlen: cranelift_module::FuncId,
     itoa: cranelift_module::FuncId,
     ftoa: cranelift_module::FuncId,
@@ -232,7 +231,6 @@ impl Compiler {
         let malloc = self.declare_import("malloc", &mut [types::I64], &mut [types::I64])?;
         let free = self.declare_import("free", &mut [types::I64], &mut [])?;
         let memcpy = self.declare_import("memcpy", &mut [types::I64, types::I64, types::I64], &mut [types::I64])?;
-        let puts = self.declare_import("puts", &mut [types::I64], &mut [types::I64])?;
         let strlen = self.declare_import("strlen", &mut [types::I64], &mut [types::I64])?;
         // `print` streams bytes straight to stdout via write(2).
         let write_import = self.declare_import(
@@ -254,7 +252,6 @@ impl Compiler {
             malloc,
             free,
             memcpy,
-            puts,
             strlen,
             itoa,
             ftoa,
@@ -604,7 +601,6 @@ impl Compiler {
             malloc,
             free,
             memcpy,
-            puts,
             strlen,
             itoa,
             ftoa,
@@ -612,6 +608,8 @@ impl Compiler {
             read_line_raw,
             read_line_len,
         } = imports;
+        // A lone newline for `println` (written by length, so no NUL needed).
+        let s_newline_id = self.declare_bytes("quill_s_newline", b"\n");
         // quill_alloc(tag, nfields) -> ptr
         {
             let target_config = self.module.target_config();
@@ -793,7 +791,9 @@ impl Compiler {
         }
 
         // quill_println(v) — format any value structurally (via quill_show)
-        // and write it plus a newline to stdout, like the interpreter.
+        // and write its bytes plus a newline to stdout, like the
+        // interpreter. `write` is used with the stored byte length so
+        // embedded NUL bytes survive (puts would stop at the first NUL).
         {
             let target_config = self.module.target_config();
             let mut sig = Signature::new(CallConv::SystemV);
@@ -805,9 +805,10 @@ impl Compiler {
             let mut ctx = self.module.make_context();
             ctx.func.name = UserFuncName::testcase("quill_println");
             ctx.func.signature = sig;
-            let puts_ref = self.module.declare_func_in_func(puts, &mut ctx.func);
+            let write_ref = self.module.declare_func_in_func(write_import, &mut ctx.func);
             let show_ref = self.declare_rt_in(&mut ctx, "quill_show", &plain_sig(1));
             let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
+            let s_nl_gv = self.module.declare_data_in_func(s_newline_id, &mut ctx.func);
             {
                 let mut fctx = FunctionBuilderContext::new();
                 let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -817,8 +818,12 @@ impl Compiler {
                 let p = bcx.block_params(block)[0];
                 let call = bcx.ins().call(show_ref, &[p]);
                 let s = bcx.inst_results(call)[0];
+                let len = bcx.ins().load(types::I64, MemFlagsData::new(), s, 16);
                 let data = bcx.ins().iadd_imm_s(s, 24);
-                bcx.ins().call(puts_ref, &[data]);
+                let one = bcx.ins().iconst(types::I64, 1);
+                bcx.ins().call(write_ref, &[one, data, len]);
+                let nl = bcx.ins().symbol_value(types::I64, s_nl_gv);
+                bcx.ins().call(write_ref, &[one, nl, one]);
                 bcx.ins().call(release_ref, &[s]);
                 bcx.ins().return_(&[]);
                 bcx.seal_all_blocks();
