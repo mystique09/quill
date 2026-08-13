@@ -45,7 +45,7 @@ pub fn check(source: &str) -> Result<infer::TypeInfo, Vec<Diagnostic>> {
 
 /// Compile a source file to a relocatable object file.
 pub fn compile_file(path: &Path) -> Result<Vec<u8>, Vec<Diagnostic>> {
-    let program = modules::Loader::without_prelude().load_file(path)?;
+    let program = modules::Loader::new().load_file(path)?;
     let types = infer::infer_program(&program)?;
     compile::compile_object(&program, &types)
         .map_err(|e| vec![Diagnostic::error(7000, e, None)])

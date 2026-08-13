@@ -263,3 +263,159 @@ fn native_compile_strings() {
     assert!(object.len() > 100, "object too small: {} bytes", object.len());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn native_compile_show_floats_tuples() {
+    // Floats, tuples, and structural `show` compile to object code.
+    let dir = std::env::temp_dir().join("quill_native_show_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("show.q");
+    std::fs::write(
+        &path,
+        "data Shape = Circle Float\n\
+         pair x y = (x, y)\n\
+         main = println (show (Circle 2.0) ++ \" \" ++ show (pair 1 2))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_compile_records() {
+    // Record construction, projection, and patterns compile to object code.
+    let dir = std::env::temp_dir().join("quill_native_record_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("record.q");
+    std::fs::write(
+        &path,
+        "data P = P { x :: Int, y :: Int }\n\
+         bump :: P -> P\n\
+         bump p = P { x = p.x + 1, y = p.y }\n\
+         sumXY :: P -> Int\n\
+         sumXY (P { x = a, y = b }) = a + b\n\
+         main = println (show (sumXY (bump (P { x = 40, y = 1 }))))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_compile_typeclasses() {
+    // Class methods dispatch on the receiver's runtime tag.
+    let dir = std::env::temp_dir().join("quill_native_class_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("class.q");
+    std::fs::write(
+        &path,
+        "data Shape = Circle Float | Square Float\n\
+         class Area a where area :: a -> Float\n\
+         instance Area Shape where\n\
+         \x20 area (Circle r) = 3.0 * r\n\
+         \x20 area (Square s) = s * s\n\
+         main = println (show (area (Circle 2.0) + area (Square 3.0)))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_compile_mutation() {
+    // `mut` bindings, `:=`, and closures that mutate their captures compile.
+    let dir = std::env::temp_dir().join("quill_native_mut_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mut.q");
+    std::fs::write(
+        &path,
+        "counter = let mut n = 0\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20bump x = n := n + x\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20in let _ = bump 3 in let _ = bump 4 in n\n\
+         main = println (show counter)\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_compile_prelude() {
+    // The implicit Std.List prelude resolves in native builds.
+    let dir = std::env::temp_dir().join("quill_native_prelude_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("prelude.q");
+    std::fs::write(
+        &path,
+        "double x = x * 2\n\
+         main = println (show (map double [1, 2, 3]))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(object.len() > 100, "object too small: {} bytes", object.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Link and run a compiled program, asserting its stdout. This exercises the
+/// runtime (reference counting, boxing, `show`, dispatch) end to end; the
+/// other native tests only check object emission. Skipped when no C compiler
+/// is available.
+#[test]
+fn native_link_and_run() {
+    let dir = std::env::temp_dir().join("quill_native_run_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run.q");
+    std::fs::write(
+        &path,
+        "data Shape = Circle Float | Square Float\n\
+         class Area a where area :: a -> Float\n\
+         instance Area Shape where\n\
+         \x20 area (Circle r) = 3.0 * r\n\
+         \x20 area (Square s) = s * s\n\
+         data P = P { x :: Int, y :: Int }\n\
+         bump :: P -> P\n\
+         bump p = P { x = p.x + 1, y = p.y }\n\
+         counter = let mut n = 0\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20bumpC x = n := n + x\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20in let _ = bumpC 3 in let _ = bumpC 4 in n\n\
+         main = println\n\
+         \x20 ( show (area (Circle 2.0)) ++ \" \" ++ show (area (Square 3.0))\n\
+         \x20   ++ \" \" ++ show (bump (P { x = 40, y = 1 })).x\n\
+         \x20   ++ \" \" ++ show counter ++ \" \" ++ show (map (\\x -> x * 2) [1, 2, 3])\n\
+         \x20   ++ \" \" ++ show (1, \"two\") )\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("run.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("run");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "6.0 9.0 41 7 [2, 4, 6] (1, two)\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
