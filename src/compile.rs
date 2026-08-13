@@ -221,7 +221,7 @@ impl Compiler {
                 let sym = format!("q_{}", f.name);
                 let id = self
                     .module
-                    .declare_function(&sym, Linkage::Local, &plain_sig(2))
+                    .declare_function(&sym, Linkage::Local, &fn_sig(2))
                     .map_err(|e| format!("declare {}: {e}", f.name))?;
                 func_ids.insert(f.name.clone(), id);
             }
@@ -271,7 +271,7 @@ impl Compiler {
             self.arities.insert(name.clone(), params.len());
             let id = self
                 .module
-                .declare_function(&name, Linkage::Local, &plain_sig(2))
+                .declare_function(&name, Linkage::Local, &fn_sig(2))
                 .map_err(|e| format!("declare {name}: {e}"))?;
             func_ids.insert(name.clone(), id);
             lambda_fns.push((
@@ -390,7 +390,7 @@ impl Compiler {
                 self.arities.insert(name.clone(), arity);
                 let id = self
                     .module
-                    .declare_function(&name, Linkage::Local, &plain_sig(2))
+                    .declare_function(&name, Linkage::Local, &fn_sig(2))
                     .map_err(|e| format!("declare {name}: {e}"))?;
                 func_ids.insert(name.clone(), id);
                 inst_fns.push((Function { name, clauses }, free_vars, cell_vars));
@@ -435,7 +435,7 @@ impl Compiler {
                 self.arities.insert(name.clone(), params.len());
                 let id = self
                     .module
-                    .declare_function(&name, Linkage::Local, &plain_sig(2))
+                    .declare_function(&name, Linkage::Local, &fn_sig(2))
                     .map_err(|e| format!("declare {name}: {e}"))?;
                 func_ids.insert(name.clone(), id);
                 inst_fns.push((
@@ -928,7 +928,7 @@ impl Compiler {
             {
                 let mut fctx = FunctionBuilderContext::new();
                 let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-                let entry_sig = bcx.import_signature(plain_sig(2));
+                let entry_sig = bcx.import_signature(fn_sig(2));
                 let block = bcx.create_block();
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
@@ -2049,7 +2049,7 @@ impl Compiler {
         // captured environment) and a boxed list of its actual arguments. This
         // uniform convention is what lets closures apply a function value
         // generically.
-        ctx.func.signature = plain_sig(2);
+        ctx.func.signature = fn_sig(2);
 
         let mut funcrefs: HashMap<String, FuncRef> = HashMap::new();
         for (name, fid) in func_ids {
@@ -2321,8 +2321,16 @@ impl Compiler {
                     }
                 }
 
-                let body =
-                    self.gen_expr(&mut bcx, &clause.body, &vars, &funcrefs, rt, cell_vars)?;
+                let self_ref = funcrefs[&f.name];
+                let body = self.gen_expr(
+                    &mut bcx,
+                    &clause.body,
+                    &vars,
+                    &funcrefs,
+                    rt,
+                    cell_vars,
+                    Some((&f.name, arity, self_ref)),
+                )?;
 
                 for val in &owned {
                     release(&mut bcx, rt, *val);
@@ -2616,6 +2624,7 @@ impl Compiler {
         funcrefs: &HashMap<String, FuncRef>,
         rt: Rt,
         cells: &std::collections::HashSet<String>,
+        tail: Option<(&str, usize, FuncRef)>,
     ) -> Result<Value, String> {
         match e {
             Expr::Int(n, _) => {
@@ -2638,7 +2647,7 @@ impl Compiler {
             }
             // Under immutability + ARC, `clone`, `&`, and `*` are identities.
             Expr::Clone(e, _) | Expr::Borrow { expr: e, .. } | Expr::Deref(e, _) => {
-                self.gen_expr(bcx, e, vars, funcrefs, rt, cells)
+                self.gen_expr(bcx, e, vars, funcrefs, rt, cells, None)
             }
             Expr::List(es, _) => {
                 // Build from the tail: `[]` then fold cons from right to left.
@@ -2647,7 +2656,7 @@ impl Compiler {
                 let call = bcx.ins().call(rt.alloc, &[nil_tag, zero]);
                 let mut acc = bcx.inst_results(call)[0];
                 for e in es.iter().rev() {
-                    let v = self.gen_expr(bcx, e, vars, funcrefs, rt, cells)?;
+                    let v = self.gen_expr(bcx, e, vars, funcrefs, rt, cells, None)?;
                     let call = bcx.ins().call(rt.cons, &[v, acc]);
                     acc = bcx.inst_results(call)[0];
                 }
@@ -2659,7 +2668,7 @@ impl Compiler {
                 let call = bcx.ins().call(rt.alloc, &[tag, nfields]);
                 let obj = bcx.inst_results(call)[0];
                 for (k, e) in es.iter().enumerate() {
-                    let v = self.gen_expr(bcx, e, vars, funcrefs, rt, cells)?;
+                    let v = self.gen_expr(bcx, e, vars, funcrefs, rt, cells, None)?;
                     let offset = 24 + (k as i64) * 8;
                     bcx.ins().store(MemFlagsData::new(), v, obj, offset as i32);
                 }
@@ -2690,7 +2699,7 @@ impl Compiler {
                         .ok_or_else(|| {
                             format!("constructor `{ctor}` requires field `{fname}`")
                         })?;
-                    let v = self.gen_expr(bcx, e, vars, funcrefs, rt, cells)?;
+                    let v = self.gen_expr(bcx, e, vars, funcrefs, rt, cells, None)?;
                     let offset = 24 + (k as i64) * 8;
                     bcx.ins().store(MemFlagsData::new(), v, obj, offset as i32);
                 }
@@ -2703,7 +2712,7 @@ impl Compiler {
                     .get(name)
                     .map(|(_, i)| *i)
                     .ok_or_else(|| format!("no field `{name}`"))?;
-                let obj = self.gen_expr(bcx, e, vars, funcrefs, rt, cells)?;
+                let obj = self.gen_expr(bcx, e, vars, funcrefs, rt, cells, None)?;
                 let offset = 24 + (idx as i64) * 8;
                 let fv = bcx
                     .ins()
@@ -2793,7 +2802,7 @@ impl Compiler {
                 Ok(make_closure(bcx, arity, func_ref, env, rt))
             }
             Expr::If(c, t, el, _) => {
-                let cond = self.gen_expr(bcx, c, vars, funcrefs, rt, cells)?;
+                let cond = self.gen_expr(bcx, c, vars, funcrefs, rt, cells, None)?;
                 let bit = unbox(bcx, cond);
                 release(bcx, rt, cond);
                 let then_b = bcx.create_block();
@@ -2802,10 +2811,10 @@ impl Compiler {
                 let merge_param = bcx.append_block_param(merge_b, types::I64);
                 bcx.ins().brif(bit, then_b, &[], else_b, &[]);
                 bcx.switch_to_block(then_b);
-                let tv = self.gen_expr(bcx, t, vars, funcrefs, rt, cells)?;
+                let tv = self.gen_expr(bcx, t, vars, funcrefs, rt, cells, tail)?;
                 bcx.ins().jump(merge_b, &[BlockArg::Value(tv)]);
                 bcx.switch_to_block(else_b);
-                let ev = self.gen_expr(bcx, el, vars, funcrefs, rt, cells)?;
+                let ev = self.gen_expr(bcx, el, vars, funcrefs, rt, cells, tail)?;
                 bcx.ins().jump(merge_b, &[BlockArg::Value(ev)]);
                 bcx.seal_block(then_b);
                 bcx.seal_block(else_b);
@@ -2820,7 +2829,7 @@ impl Compiler {
                 for b in bindings {
                     match b.lhs.first() {
                         Some(Pattern::Var(name, _)) => {
-                            let v = self.gen_expr(bcx, &b.expr, &new_vars, funcrefs, rt, cells)?;
+                            let v = self.gen_expr(bcx, &b.expr, &new_vars, funcrefs, rt, cells, None)?;
                             let var = bcx.declare_var(types::I64);
                             let stored = if b.mutable {
                                 // Mutable bindings live in a cell so closures
@@ -2840,7 +2849,7 @@ impl Compiler {
                             new_vars.insert(name.clone(), var);
                         }
                         Some(Pattern::Wildcard(_)) => {
-                            let v = self.gen_expr(bcx, &b.expr, &new_vars, funcrefs, rt, cells)?;
+                            let v = self.gen_expr(bcx, &b.expr, &new_vars, funcrefs, rt, cells, None)?;
                             release(bcx, rt, v);
                         }
                         _ => {
@@ -2850,7 +2859,7 @@ impl Compiler {
                         }
                     }
                 }
-                let result = self.gen_expr(bcx, body, &new_vars, funcrefs, rt, &new_cells)?;
+                let result = self.gen_expr(bcx, body, &new_vars, funcrefs, rt, &new_cells, tail)?;
                 for val in &owned {
                     release(bcx, rt, *val);
                 }
@@ -2866,7 +2875,7 @@ impl Compiler {
                         "cannot assign to immutable variable `{name}`; declare it with `mut`"
                     ));
                 }
-                let v = self.gen_expr(bcx, e, vars, funcrefs, rt, cells)?;
+                let v = self.gen_expr(bcx, e, vars, funcrefs, rt, cells, None)?;
                 let cell = bcx.use_var(var);
                 let old = bcx.ins().load(types::I64, MemFlagsData::new(), cell, 24);
                 // The cell takes ownership of `v`; retain it once more for the
@@ -2876,9 +2885,9 @@ impl Compiler {
                 release(bcx, rt, old);
                 Ok(v)
             }
-            Expr::Ascribe(e, _, _) => self.gen_expr(bcx, e, vars, funcrefs, rt, cells),
-            Expr::Case(scrut, alts, _) => self.gen_case(bcx, scrut, alts, vars, funcrefs, rt, cells),
-            Expr::App(..) => self.gen_apply(bcx, e, vars, funcrefs, rt, cells),
+            Expr::Ascribe(e, _, _) => self.gen_expr(bcx, e, vars, funcrefs, rt, cells, tail),
+            Expr::Case(scrut, alts, _) => self.gen_case(bcx, scrut, alts, vars, funcrefs, rt, cells, tail),
+            Expr::App(..) => self.gen_apply(bcx, e, vars, funcrefs, rt, cells, tail),
             other => Err(format!("unsupported expression: {other:?}")),
         }
     }
@@ -2892,8 +2901,9 @@ impl Compiler {
         funcrefs: &HashMap<String, FuncRef>,
         rt: Rt,
         cells: &std::collections::HashSet<String>,
+        tail: Option<(&str, usize, FuncRef)>,
     ) -> Result<Value, String> {
-        let sv = self.gen_expr(bcx, scrut, vars, funcrefs, rt, cells)?;
+        let sv = self.gen_expr(bcx, scrut, vars, funcrefs, rt, cells, None)?;
         let merge = bcx.create_block();
         let merge_param = bcx.append_block_param(merge, types::I64);
         let mut alt_blocks = Vec::new();
@@ -2914,7 +2924,7 @@ impl Compiler {
             let mut avars = vars.clone();
             let mut owned = Vec::new();
             self.match_alt(bcx, &alt.pat, sv, &mut avars, &mut owned, next, rt)?;
-            let body = self.gen_expr(bcx, &alt.body, &avars, funcrefs, rt, cells)?;
+            let body = self.gen_expr(bcx, &alt.body, &avars, funcrefs, rt, cells, tail)?;
             for val in &owned {
                 release(bcx, rt, *val);
             }
@@ -3093,6 +3103,7 @@ impl Compiler {
         funcrefs: &HashMap<String, FuncRef>,
         rt: Rt,
         cells: &std::collections::HashSet<String>,
+        tail: Option<(&str, usize, FuncRef)>,
     ) -> Result<Value, String> {
         let mut args: Vec<Expr> = Vec::new();
         let mut head = e.clone();
@@ -3117,14 +3128,14 @@ impl Compiler {
 
         if let Some(name) = head_name.as_deref() {
             if is_builtin(name) {
-                return self.gen_builtin(bcx, name, &args, vars, funcrefs, rt, cells);
+                return self.gen_builtin(bcx, name, &args, vars, funcrefs, rt, cells, None);
             }
 
             // Constructor application.
             if let Some(ctor_idx) = self.info.ctor_of(name) {
                 let mut arg_vals = Vec::new();
                 for a in &args {
-                    arg_vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells)?);
+                    arg_vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells, None)?);
                 }
                 let tag = bcx.ins().iconst(types::I64, ctor_idx as i64);
                 let nfields = bcx.ins().iconst(types::I64, args.len() as i64);
@@ -3146,7 +3157,7 @@ impl Compiler {
                     let call0 = bcx.ins().call(callee, &[nil, nil]);
                     let mut closure = bcx.inst_results(call0)[0];
                     for a in &args {
-                        let av = self.gen_expr(bcx, a, vars, funcrefs, rt, cells)?;
+                        let av = self.gen_expr(bcx, a, vars, funcrefs, rt, cells, None)?;
                         let call = bcx.ins().call(rt.apply, &[closure, av]);
                         let r = bcx.inst_results(call)[0];
                         release(bcx, rt, closure);
@@ -3156,7 +3167,21 @@ impl Compiler {
                 }
                 let mut arg_vals = Vec::new();
                 for a in &args {
-                    arg_vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells)?);
+                    arg_vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells, None)?);
+                }
+                if let Some((self_name, self_arity, self_ref)) = tail {
+                    if name == self_name && args.len() == self_arity {
+                        // A self-recursive call in tail position: jump to
+                        // ourselves instead of calling, so deep recursion
+                        // runs in constant stack.
+                        let list = build_args_list(bcx, &arg_vals, rt);
+                        let nil = make_nil(bcx, rt);
+                        bcx.ins().return_call(self_ref, &[nil, list]);
+                        let dead = bcx.create_block();
+                        bcx.switch_to_block(dead);
+                        let zero = bcx.ins().iconst(types::I64, 0);
+                        return Ok(box_int(bcx, zero, rt));
+                    }
                 }
                 if args.len() == arity {
                     // Full application: call directly (the closure is unused).
@@ -3197,7 +3222,7 @@ impl Compiler {
             if let Some(impls) = self.method_dispatch.get(name).cloned() {
                 let mut arg_vals = Vec::new();
                 for a in &args {
-                    arg_vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells)?);
+                    arg_vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells, None)?);
                 }
                 if arg_vals.is_empty() {
                     return Err(format!("method `{name}` requires an argument"));
@@ -3265,9 +3290,9 @@ impl Compiler {
 
         // A function value in head position (a local variable or a lambda):
         // evaluate it and apply the arguments one at a time.
-        let mut closure = self.gen_expr(bcx, &head, vars, funcrefs, rt, cells)?;
+        let mut closure = self.gen_expr(bcx, &head, vars, funcrefs, rt, cells, None)?;
         for a in &args {
-            let av = self.gen_expr(bcx, a, vars, funcrefs, rt, cells)?;
+            let av = self.gen_expr(bcx, a, vars, funcrefs, rt, cells, None)?;
             let call = bcx.ins().call(rt.apply, &[closure, av]);
             let r = bcx.inst_results(call)[0];
             release(bcx, rt, closure);
@@ -3285,10 +3310,11 @@ impl Compiler {
         funcrefs: &HashMap<String, FuncRef>,
         rt: Rt,
         cells: &std::collections::HashSet<String>,
+        _tail: Option<(&str, usize, FuncRef)>,
     ) -> Result<Value, String> {
         let mut vals = Vec::new();
         for a in args {
-            vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells)?);
+            vals.push(self.gen_expr(bcx, a, vars, funcrefs, rt, cells, None)?);
         }
         match op {
             "+" | "-" | "*" | "/" | "%" => {
@@ -3533,6 +3559,18 @@ impl Compiler {
 
 fn plain_sig(arity: usize) -> Signature {
     let mut sig = Signature::new(CallConv::SystemV);
+    for _ in 0..arity {
+        sig.params.push(AbiParam::new(types::I64));
+    }
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
+}
+
+/// The signature of a compiled Quill function (closure, args list) -> value.
+/// These use the tail calling convention so self-recursive tail calls become
+/// real jumps.
+fn fn_sig(arity: usize) -> Signature {
+    let mut sig = Signature::new(CallConv::Tail);
     for _ in 0..arity {
         sig.params.push(AbiParam::new(types::I64));
     }
