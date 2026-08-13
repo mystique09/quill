@@ -66,10 +66,12 @@ char *quill_ftoa(long bits) {
     return out;
 }
 
-/* Read one line of stdin without its trailing newline/CR; NULL at end of
- * input. The returned buffer is malloc'd; the caller boxes it and frees it.
- * The length (which can include embedded NUL bytes) is stashed in
- * `quill_line_len`, because the caller cannot recover it with strlen. */
+/* Read one line of stdin without its trailing newline/CR. Returns NULL at
+ * end of input and (char *)-1 on a read error (so the caller can trap,
+ * mirroring the interpreter's readLine error). The returned buffer is
+ * malloc'd; the caller boxes it and frees it. The length (which can include
+ * embedded NUL bytes) is stashed in `quill_line_len`, because the caller
+ * cannot recover it with strlen. */
 static ssize_t quill_line_len = 0;
 
 char *quill_read_line_raw(void) {
@@ -79,7 +81,7 @@ char *quill_read_line_raw(void) {
     if (n < 0) {
         free(line);
         quill_line_len = 0;
-        return NULL;
+        return ferror(stdin) ? (char *)-1 : NULL;
     }
     while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
         line[--n] = '\0';

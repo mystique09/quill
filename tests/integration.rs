@@ -583,13 +583,31 @@ fn native_link_and_run_stdlib() {
 
 #[test]
 fn readline_intrinsic_is_typed() {
-    // `_readLine` is internal to Std.IO: it is only bound when Std.Option is
-    // loaded, and then with its true `() -> Option String` type — misusing it
-    // must be a type error, never a runtime crash or garbage.
+    // `_readLine` is internal to Std.IO: it is never bound for user code (the
+    // intrinsic lives under the module-qualified flat name `Std.IO._readLine`,
+    // which source identifiers cannot spell), so direct use is a compile-time
+    // error — never a runtime crash or garbage.
     let e = run_err("main = println (show (_readLine () + 1))");
     assert!(e.contains("unbound name"), "got: {e}");
     let e = run_err("use Std.IO\nmain = println (show (_readLine () + 1))");
-    assert!(e.contains("type mismatch"), "got: {e}");
+    assert!(e.contains("unbound name"), "got: {e}");
+    // A user's own `_readLine` definition is a perfectly ordinary function.
+    let src = "_readLine _ = 42\nmain = println (show (_readLine ()))";
+    assert_eq!(run_ok(src), "42\n");
+}
+
+#[test]
+fn readline_intrinsic_isolated_from_user_defs() {
+    // Even when the importing program defines `_readLine`, Std.IO's readLine
+    // must keep calling the intrinsic (typed `() -> Option String`), not the
+    // user's function. (stdin is not exercised here; this is typecheck-only.)
+    let src = r#"
+use Std.IO as IO
+use Std.Option
+_readLine _ = 42
+main = println (case IO.readLine () of { None -> "none"; Some l -> l })
+"#;
+    quill::check(src).unwrap();
 }
 
 /// Compiled programs preserve embedded NUL bytes in stdin lines (the C

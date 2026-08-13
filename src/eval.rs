@@ -1164,9 +1164,11 @@ fn install_prelude(global: &mut Scope, info: &ProgramInfo) {
         ("floor", Builtin::Floor),
         ("ceil", Builtin::Ceil),
         ("snoc", Builtin::Snoc),
-        // Internal support for `Std.IO`; the type checker gives it
-        // `() -> Option String` when `Std.Option` is loaded.
-        ("_readLine", Builtin::ReadLine),
+        // Internal support for `Std.IO`. The binding lives under the
+        // module-qualified name `Std.IO._readLine` (declared by a signature
+        // in Std.IO), which source identifiers cannot spell, so user
+        // definitions can never replace it.
+        ("Std.IO._readLine", Builtin::ReadLine),
     ];
     for (name, b) in builtins {
         global.insert(

@@ -204,7 +204,9 @@ echo (Some l) = "you said: " ++ l
 main = println (echo (IO.readLine ()))
 ```
 
-Input works in both the interpreter and compiled binaries.
+Input works in both the interpreter and compiled binaries. End of input
+yields `None`; a genuine read error (e.g. stdin closed) is a runtime error
+in the interpreter and traps in compiled binaries.
 
 ## `main`
 

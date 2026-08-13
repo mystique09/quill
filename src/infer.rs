@@ -727,15 +727,16 @@ impl Infer {
     }
 
     /// Install builtins whose types name stdlib types, which exist only
-    /// after `collect` has registered the program's data types. `_readLine`
-    /// gets its true `() -> Option String` type — never an unconstrained
-    /// one — and is only bound when `Std.Option` is actually loaded (it is
-    /// whenever `Std.IO` is, since `Std.IO` imports it).
+    /// after `collect` has registered the program's data types. `Std.IO`'s
+    /// `_readLine` intrinsic is bound under its module-qualified flat name —
+    /// which source identifiers cannot spell, so user definitions can never
+    /// shadow it — and only when `Std.Option` is loaded, which is exactly
+    /// when `Std.IO` (the only module that references the intrinsic) is.
     fn install_stdlib_prelude(&mut self) {
         if let Some(&adt_id) = self.adt_ids.get("Std.Option.Option") {
             let option_string = Ty::Con(TyCon::Adt(adt_id), vec![Ty::string()]);
             self.insert_local(
-                "_readLine",
+                "Std.IO._readLine",
                 Scheme::mono(Ty::func(Ty::unit(), option_string)),
             );
         }

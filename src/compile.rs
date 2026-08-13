@@ -66,6 +66,9 @@ const TAG_TUPLE: i64 = -8;
 const TAG_CELL: i64 = -9;
 /// A single character; the payload word holds its (ASCII) byte value.
 const TAG_CHAR: i64 = -10;
+/// The unit value `()`: a single-payload box like Int/Bool, so `show`
+/// distinguishes it from the integer 0 (the interpreter prints `()`).
+const TAG_UNIT: i64 = -11;
 
 struct CodegenInfo {
     /// Constructor name -> globally unique constructor index (the object tag).
@@ -131,7 +134,8 @@ struct Rt {
     make_closure: FuncRef,
     apply: FuncRef,
     show: FuncRef,
-    str_tail: FuncRef,
+    /// Fresh box holding s[n..] (UTF-8 string cons patterns).
+    str_tail_n: FuncRef,
     str_eq: FuncRef,
     str_snoc: FuncRef,
     /// Reads a line from stdin as a fresh string box (0 at end of input).
@@ -1153,9 +1157,16 @@ impl Compiler {
                     tag,
                     char_tag,
                 );
+                let unit_tag = bcx.ins().iconst(types::I64, TAG_UNIT);
+                let is_unit = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    tag,
+                    unit_tag,
+                );
                 let is_num = bcx.ins().bor(is_int, is_bool);
                 let is_num = bcx.ins().bor(is_num, is_float);
                 let is_num = bcx.ins().bor(is_num, is_char);
+                let is_num = bcx.ins().bor(is_num, is_unit);
                 let is_scalar = bcx.ins().bor(is_num, is_str);
                 let release_fields = bcx.create_block();
                 let just_free = bcx.create_block();
@@ -1232,6 +1243,7 @@ impl Compiler {
 
         let s_true_id = self.declare_bytes("quill_s_true", b"true\0");
         let s_false_id = self.declare_bytes("quill_s_false", b"false\0");
+        let s_unit_id = self.declare_bytes("quill_s_unit", b"()\0");
         let s_open_id = self.declare_bytes("quill_s_open", b"[\0");
         let s_paren_id = self.declare_bytes("quill_s_paren", b"(\0");
         let s_closep_id = self.declare_bytes("quill_s_closep", b")\0");
@@ -1369,10 +1381,25 @@ impl Compiler {
                     zero,
                 );
                 let eof_b = bcx.create_block();
-                let line_b = bcx.create_block();
-                bcx.ins().brif(is_null, eof_b, &[], line_b, &[]);
+                let not_eof_b = bcx.create_block();
+                bcx.ins().brif(is_null, eof_b, &[], not_eof_b, &[]);
                 bcx.switch_to_block(eof_b);
                 bcx.ins().return_(&[zero]);
+                // A read error (e.g. stdin closed) returns the -1 sentinel;
+                // trap like the `error` builtin, mirroring the interpreter's
+                // readLine failure.
+                bcx.switch_to_block(not_eof_b);
+                let minus_one = bcx.ins().iconst(types::I64, -1);
+                let is_err = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    ptr,
+                    minus_one,
+                );
+                let line_b = bcx.create_block();
+                let err_b = bcx.create_block();
+                bcx.ins().brif(is_err, err_b, &[], line_b, &[]);
+                bcx.switch_to_block(err_b);
+                bcx.ins().trap(TrapCode::unwrap_user(2));
                 bcx.switch_to_block(line_b);
                 let call2 = bcx.ins().call(len_ref, &[]);
                 let len = bcx.inst_results(call2)[0];
@@ -1388,7 +1415,8 @@ impl Compiler {
                 .map_err(|e| format!("define quill_read_line: {e}"))?;
         }
 
-        // quill_char_str(byte) -> str — a one-character string box.
+        // quill_char_str(cp) -> str — the UTF-8 encoding of a character's
+        // code point (1-4 bytes), matching the interpreter's Rust `char`.
         {
             let target_config = self.module.target_config();
             let sig = plain_sig(1);
@@ -1406,12 +1434,115 @@ impl Compiler {
                 let block = bcx.create_block();
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
-                let byte = bcx.block_params(block)[0];
+                let cp = bcx.block_params(block)[0];
+
                 let one = bcx.ins().iconst(types::I64, 1);
-                let call = bcx.ins().call(alloc_ref, &[one]);
-                let p = bcx.inst_results(call)[0];
-                bcx.ins().store(MemFlagsData::new(), byte, p, 24);
-                bcx.ins().return_(&[p]);
+                let two = bcx.ins().iconst(types::I64, 2);
+                let three = bcx.ins().iconst(types::I64, 3);
+                let four = bcx.ins().iconst(types::I64, 4);
+                // Constants shared across the width branches.
+                let c1 = bcx.ins().iconst(types::I64, 0x80);
+                let m3f = bcx.ins().iconst(types::I64, 0x3F);
+                let six = bcx.ins().iconst(types::I64, 6);
+                let twelve = bcx.ins().iconst(types::I64, 12);
+                let eighteen = bcx.ins().iconst(types::I64, 18);
+
+                // 1 byte: cp < 0x80.
+                let e0 = bcx.ins().iconst(types::I64, 0x80);
+                let is1 = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+                    cp,
+                    e0,
+                );
+                let w1_b = bcx.create_block();
+                let w_multi = bcx.create_block();
+                bcx.ins().brif(is1, w1_b, &[], w_multi, &[]);
+                bcx.switch_to_block(w1_b);
+                let call1 = bcx.ins().call(alloc_ref, &[one]);
+                let p1 = bcx.inst_results(call1)[0];
+                let b1v = bcx.ins().ireduce(types::I8, cp);
+                bcx.ins().store(MemFlagsData::new(), b1v, p1, 24);
+                bcx.ins().return_(&[p1]);
+
+                // 2 bytes: cp < 0x800.
+                bcx.switch_to_block(w_multi);
+                let e1 = bcx.ins().iconst(types::I64, 0x800);
+                let is2 = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+                    cp,
+                    e1,
+                );
+                let w2_b = bcx.create_block();
+                let w_multi2 = bcx.create_block();
+                bcx.ins().brif(is2, w2_b, &[], w_multi2, &[]);
+                bcx.switch_to_block(w2_b);
+                let call2 = bcx.ins().call(alloc_ref, &[two]);
+                let p2 = bcx.inst_results(call2)[0];
+                let c0 = bcx.ins().iconst(types::I64, 0xC0);
+                let hi_a = bcx.ins().ushr(cp, six);
+                let hi = bcx.ins().bor(c0, hi_a);
+                let lo_a = bcx.ins().band(cp, m3f);
+                let lo = bcx.ins().bor(c1, lo_a);
+                let hi8 = bcx.ins().ireduce(types::I8, hi);
+                let lo8 = bcx.ins().ireduce(types::I8, lo);
+                bcx.ins().store(MemFlagsData::new(), hi8, p2, 24);
+                bcx.ins().store(MemFlagsData::new(), lo8, p2, 25);
+                bcx.ins().return_(&[p2]);
+
+                // 3 bytes: cp < 0x10000.
+                bcx.switch_to_block(w_multi2);
+                let e2 = bcx.ins().iconst(types::I64, 0x10000);
+                let is3 = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+                    cp,
+                    e2,
+                );
+                let w3_b = bcx.create_block();
+                let w4_b = bcx.create_block();
+                bcx.ins().brif(is3, w3_b, &[], w4_b, &[]);
+                bcx.switch_to_block(w3_b);
+                let call3 = bcx.ins().call(alloc_ref, &[three]);
+                let p3 = bcx.inst_results(call3)[0];
+                let e0c = bcx.ins().iconst(types::I64, 0xE0);
+                let b0a = bcx.ins().ushr(cp, twelve);
+                let b0 = bcx.ins().bor(e0c, b0a);
+                let mid_a = bcx.ins().ushr(cp, six);
+                let mid_aa = bcx.ins().band(mid_a, m3f);
+                let mid = bcx.ins().bor(c1, mid_aa);
+                let lo2a = bcx.ins().band(cp, m3f);
+                let lo2v = bcx.ins().bor(c1, lo2a);
+                let b0_8 = bcx.ins().ireduce(types::I8, b0);
+                let mid_8 = bcx.ins().ireduce(types::I8, mid);
+                let lo_8 = bcx.ins().ireduce(types::I8, lo2v);
+                bcx.ins().store(MemFlagsData::new(), b0_8, p3, 24);
+                bcx.ins().store(MemFlagsData::new(), mid_8, p3, 25);
+                bcx.ins().store(MemFlagsData::new(), lo_8, p3, 26);
+                bcx.ins().return_(&[p3]);
+
+                // 4 bytes.
+                bcx.switch_to_block(w4_b);
+                let call4 = bcx.ins().call(alloc_ref, &[four]);
+                let p4 = bcx.inst_results(call4)[0];
+                let f0c = bcx.ins().iconst(types::I64, 0xF0);
+                let b0b = bcx.ins().ushr(cp, eighteen);
+                let b0_4 = bcx.ins().bor(f0c, b0b);
+                let m12_a = bcx.ins().ushr(cp, twelve);
+                let m12_b = bcx.ins().band(m12_a, m3f);
+                let b1_4 = bcx.ins().bor(c1, m12_b);
+                let m6_a = bcx.ins().ushr(cp, six);
+                let m6_b = bcx.ins().band(m6_a, m3f);
+                let b2_4 = bcx.ins().bor(c1, m6_b);
+                let lo4_a = bcx.ins().band(cp, m3f);
+                let b3_4 = bcx.ins().bor(c1, lo4_a);
+                let b0_8b = bcx.ins().ireduce(types::I8, b0_4);
+                let b1_8b = bcx.ins().ireduce(types::I8, b1_4);
+                let b2_8b = bcx.ins().ireduce(types::I8, b2_4);
+                let b3_8b = bcx.ins().ireduce(types::I8, b3_4);
+                bcx.ins().store(MemFlagsData::new(), b0_8b, p4, 24);
+                bcx.ins().store(MemFlagsData::new(), b1_8b, p4, 25);
+                bcx.ins().store(MemFlagsData::new(), b2_8b, p4, 26);
+                bcx.ins().store(MemFlagsData::new(), b3_8b, p4, 27);
+                bcx.ins().return_(&[p4]);
                 bcx.seal_all_blocks();
                 bcx.finalize(target_config);
             }
@@ -1457,6 +1588,46 @@ impl Compiler {
             self.module
                 .define_function(id, &mut ctx)
                 .map_err(|e| format!("define quill_str_tail: {e}"))?;
+        }
+
+        // quill_str_tail_n(s, n) -> str — a fresh box holding s[n..], used
+        // when a string cons pattern consumed more than one byte (UTF-8).
+        {
+            let target_config = self.module.target_config();
+            let sig = plain_sig(2);
+            let id = self
+                .module
+                .declare_function("quill_str_tail_n", Linkage::Local, &sig)
+                .map_err(|e| format!("declare quill_str_tail_n: {e}"))?;
+            let mut ctx = self.module.make_context();
+            ctx.func.name = UserFuncName::testcase("quill_str_tail_n");
+            ctx.func.signature = sig;
+            let alloc_ref = self.declare_rt_in(&mut ctx, "quill_str_alloc", &plain_sig(1));
+            let memcpy_ref = self.module.declare_func_in_func(memcpy, &mut ctx.func);
+            {
+                let mut fctx = FunctionBuilderContext::new();
+                let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+                let block = bcx.create_block();
+                bcx.switch_to_block(block);
+                bcx.append_block_params_for_function_params(block);
+                let s = bcx.block_params(block)[0];
+                let n = bcx.block_params(block)[1];
+                let len = bcx.ins().load(types::I64, MemFlagsData::new(), s, 16);
+                let newlen = bcx.ins().isub(len, n);
+                let call = bcx.ins().call(alloc_ref, &[newlen]);
+                let p = bcx.inst_results(call)[0];
+                let twenty4 = bcx.ins().iconst(types::I64, 24);
+                let dst = bcx.ins().iadd(p, twenty4);
+                let src_off = bcx.ins().iadd(twenty4, n);
+                let src = bcx.ins().iadd(s, src_off);
+                bcx.ins().call(memcpy_ref, &[dst, src, newlen]);
+                bcx.ins().return_(&[p]);
+                bcx.seal_all_blocks();
+                bcx.finalize(target_config);
+            }
+            self.module
+                .define_function(id, &mut ctx)
+                .map_err(|e| format!("define quill_str_tail_n: {e}"))?;
         }
 
         // quill_str_eq(s, bytes, len) -> i64 — does the string box equal the
@@ -1533,7 +1704,7 @@ impl Compiler {
         }
 
         // quill_str_snoc(s, char_box) -> str — a fresh string with the
-        // character appended.
+        // character (UTF-8 encoded, via quill_char_str) appended.
         {
             let target_config = self.module.target_config();
             let sig = plain_sig(2);
@@ -1544,8 +1715,9 @@ impl Compiler {
             let mut ctx = self.module.make_context();
             ctx.func.name = UserFuncName::testcase("quill_str_snoc");
             ctx.func.signature = sig;
-            let alloc_ref = self.declare_rt_in(&mut ctx, "quill_str_alloc", &plain_sig(1));
-            let memcpy_ref = self.module.declare_func_in_func(memcpy, &mut ctx.func);
+            let concat_ref = self.declare_rt_in(&mut ctx, "quill_str_concat", &plain_sig(2));
+            let char_str_ref = self.declare_rt_in(&mut ctx, "quill_char_str", &plain_sig(1));
+            let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
             {
                 let mut fctx = FunctionBuilderContext::new();
                 let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -1553,22 +1725,13 @@ impl Compiler {
                 bcx.switch_to_block(block);
                 bcx.append_block_params_for_function_params(block);
                 let (s, c) = (bcx.block_params(block)[0], bcx.block_params(block)[1]);
-                let len = bcx.ins().load(types::I64, MemFlagsData::new(), s, 16);
-                let one = bcx.ins().iconst(types::I64, 1);
-                let newlen = bcx.ins().iadd(len, one);
-                let call = bcx.ins().call(alloc_ref, &[newlen]);
-                let p = bcx.inst_results(call)[0];
-                let twenty4 = bcx.ins().iconst(types::I64, 24);
-                let dst = bcx.ins().iadd(p, twenty4);
-                let src = bcx.ins().iadd(s, twenty4);
-                bcx.ins().call(memcpy_ref, &[dst, src, len]);
-                // Store a single byte (an 8-byte word would overrun the box
-                // when the length isn't word-aligned).
-                let byte = bcx.ins().load(types::I8, MemFlagsData::new(), c, 24);
-                let last = bcx.ins().iadd(p, len);
-                let last = bcx.ins().iadd_imm_s(last, 24);
-                bcx.ins().store(MemFlagsData::new(), byte, last, 0);
-                bcx.ins().return_(&[p]);
+                let cp = bcx.ins().load(types::I64, MemFlagsData::new(), c, 24);
+                let cs_call = bcx.ins().call(char_str_ref, &[cp]);
+                let cs = bcx.inst_results(cs_call)[0];
+                let r_call = bcx.ins().call(concat_ref, &[s, cs]);
+                let r = bcx.inst_results(r_call)[0];
+                bcx.ins().call(release_ref, &[cs]);
+                bcx.ins().return_(&[r]);
                 bcx.seal_all_blocks();
                 bcx.finalize(target_config);
             }
@@ -1673,6 +1836,7 @@ impl Compiler {
             let char_str_ref = self.declare_rt_in(&mut ctx, "quill_char_str", &plain_sig(1));
             let s_true_gv = self.module.declare_data_in_func(s_true_id, &mut ctx.func);
             let s_false_gv = self.module.declare_data_in_func(s_false_id, &mut ctx.func);
+            let s_unit_gv = self.module.declare_data_in_func(s_unit_id, &mut ctx.func);
             let s_open_gv = self.module.declare_data_in_func(s_open_id, &mut ctx.func);
             let s_space_gv = self.module.declare_data_in_func(s_space_id, &mut ctx.func);
             let s_nil_gv = self.module.declare_data_in_func(s_nil_id, &mut ctx.func);
@@ -1692,7 +1856,25 @@ impl Compiler {
                 let tag = bcx.ins().load(types::I64, MemFlagsData::new(), p, 8);
                 let payload = bcx.ins().load(types::I64, MemFlagsData::new(), p, 24);
 
+                // Unit -> "()", matching the interpreter's `show`.
+                let unit_tag = bcx.ins().iconst(types::I64, TAG_UNIT);
+                let is_unit = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    tag,
+                    unit_tag,
+                );
+                let unit_b = bcx.create_block();
+                let chk_int = bcx.create_block();
+                bcx.ins().brif(is_unit, unit_b, &[], chk_int, &[]);
+                bcx.switch_to_block(unit_b);
+                let s_unit = bcx.ins().symbol_value(types::I64, s_unit_gv);
+                let two_u = bcx.ins().iconst(types::I64, 2);
+                let cu = bcx.ins().call(from_bytes_ref, &[s_unit, two_u]);
+                let ru = bcx.inst_results(cu)[0];
+                bcx.ins().return_(&[ru]);
+
                 // Int -> itoa.
+                bcx.switch_to_block(chk_int);
                 let int_tag = bcx.ins().iconst(types::I64, TAG_INT);
                 let is_int = bcx.ins().icmp(
                     cranelift_codegen::ir::condcodes::IntCC::Equal,
@@ -2107,7 +2289,14 @@ impl Compiler {
                 tag,
                 bool_tag,
             );
+            let unit_tag = bcx.ins().iconst(types::I64, TAG_UNIT);
+            let is_unit = bcx.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::Equal,
+                tag,
+                unit_tag,
+            );
             let is_scalar = bcx.ins().bor(is_int, is_bool);
+            let is_scalar = bcx.ins().bor(is_scalar, is_unit);
             let scalar_b = bcx.create_block();
             let other_b = bcx.create_block();
             let merge_b = bcx.create_block();
@@ -2197,7 +2386,7 @@ impl Compiler {
             make_closure: self.declare_rt_in(&mut ctx, "quill_make_closure", &plain_sig(5)),
             apply: self.declare_rt_in(&mut ctx, "quill_apply", &plain_sig(2)),
             show: self.declare_rt_in(&mut ctx, "quill_show", &plain_sig(1)),
-            str_tail: self.declare_rt_in(&mut ctx, "quill_str_tail", &plain_sig(1)),
+            str_tail_n: self.declare_rt_in(&mut ctx, "quill_str_tail_n", &plain_sig(2)),
             str_eq: self.declare_rt_in(&mut ctx, "quill_str_eq", &plain_sig(3)),
             str_snoc: self.declare_rt_in(&mut ctx, "quill_str_snoc", &plain_sig(2)),
             read_line: self.declare_rt_in(&mut ctx, "quill_read_line", &plain_sig(0)),
@@ -2554,8 +2743,10 @@ impl Compiler {
         let tail = bcx.ins().load(types::I64, MemFlagsData::new(), value, 32);
         bcx.ins().jump(merge_b, &[BlockArg::Value(head), BlockArg::Value(tail)]);
 
-        // String path: the first byte as a Char box and the rest as a fresh
-        // string.
+        // String path: decode the first UTF-8 character (1-4 bytes) — like
+        // the interpreter, which takes the first Rust `char` — and the rest
+        // as a fresh string. Malformed/truncated sequences fall back to a
+        // single byte.
         bcx.switch_to_block(chk_str_b);
         let str_tag = bcx.ins().iconst(types::I64, TAG_STR);
         let is_str = bcx.ins().icmp(
@@ -2576,10 +2767,160 @@ impl Compiler {
         let nonempty_b = bcx.create_block();
         bcx.ins().brif(nonempty, nonempty_b, &[], next, &[]);
         bcx.switch_to_block(nonempty_b);
-        let byte = bcx.ins().load(types::I8, MemFlagsData::new(), value, 24);
-        let byte64 = bcx.ins().uextend(types::I64, byte);
-        let char_box = box_char(bcx, byte64, rt);
-        let call = bcx.ins().call(rt.str_tail, &[value]);
+
+        let b0 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 24);
+        let b0z = bcx.ins().uextend(types::I64, b0);
+        let one = bcx.ins().iconst(types::I64, 1);
+        // Constants shared by the multi-byte branches below (they must be
+        // defined before the branch so they dominate every user).
+        let lo2 = bcx.ins().iconst(types::I64, 0x3F);
+        let six = bcx.ins().iconst(types::I64, 6);
+        let twelve = bcx.ins().iconst(types::I64, 12);
+
+        // Head block: (codepoint, consumed bytes) -> char box + tail.
+        let head_b = bcx.create_block();
+        let cp_param = bcx.append_block_param(head_b, types::I64);
+        let n_param = bcx.append_block_param(head_b, types::I64);
+
+        // ASCII: 0xxxxxxx.
+        let ascii_lim = bcx.ins().iconst(types::I64, 0x80);
+        let is_ascii = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+            b0z,
+            ascii_lim,
+        );
+        let one_b = bcx.create_block();
+        let multi_b = bcx.create_block();
+        bcx.ins().brif(is_ascii, one_b, &[], multi_b, &[]);
+        bcx.switch_to_block(one_b);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+
+        // 2-byte lead: 110xxxxx.
+        bcx.switch_to_block(multi_b);
+        let lead2_mask = bcx.ins().iconst(types::I64, 0xE0);
+        let lead2_val = bcx.ins().iconst(types::I64, 0xC0);
+        let b02 = bcx.ins().band(b0z, lead2_mask);
+        let is2 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            b02,
+            lead2_val,
+        );
+        let two_b = bcx.create_block();
+        let three_chk = bcx.create_block();
+        bcx.ins().brif(is2, two_b, &[], three_chk, &[]);
+        bcx.switch_to_block(two_b);
+        let two = bcx.ins().iconst(types::I64, 2);
+        let len2 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+            slen,
+            two,
+        );
+        let two_ok = bcx.create_block();
+        let fb2 = bcx.create_block();
+        bcx.ins().brif(len2, two_ok, &[], fb2, &[]);
+        bcx.switch_to_block(two_ok);
+        let b1 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 25);
+        let b1z = bcx.ins().uextend(types::I64, b1);
+        let lo1 = bcx.ins().iconst(types::I64, 0x1F);
+        let hi_a = bcx.ins().band(b0z, lo1);
+        let hi = bcx.ins().ishl(hi_a, six);
+        let lo_b = bcx.ins().band(b1z, lo2);
+        let cp2 = bcx.ins().bor(hi, lo_b);
+        bcx.ins().jump(head_b, &[BlockArg::Value(cp2), BlockArg::Value(two)]);
+        bcx.switch_to_block(fb2);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+
+        // 3-byte lead: 1110xxxx.
+        bcx.switch_to_block(three_chk);
+        let lead3_mask = bcx.ins().iconst(types::I64, 0xF0);
+        let lead3_val = bcx.ins().iconst(types::I64, 0xE0);
+        let b03 = bcx.ins().band(b0z, lead3_mask);
+        let is3 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            b03,
+            lead3_val,
+        );
+        let three_b = bcx.create_block();
+        let four_chk = bcx.create_block();
+        bcx.ins().brif(is3, three_b, &[], four_chk, &[]);
+        bcx.switch_to_block(three_b);
+        let three = bcx.ins().iconst(types::I64, 3);
+        let len3 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+            slen,
+            three,
+        );
+        let three_ok = bcx.create_block();
+        let fb3 = bcx.create_block();
+        bcx.ins().brif(len3, three_ok, &[], fb3, &[]);
+        bcx.switch_to_block(three_ok);
+        let c1 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 25);
+        let c1z = bcx.ins().uextend(types::I64, c1);
+        let c2 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 26);
+        let c2z = bcx.ins().uextend(types::I64, c2);
+        let lo3 = bcx.ins().iconst(types::I64, 0x0F);
+        let hi3a = bcx.ins().band(b0z, lo3);
+        let hi3 = bcx.ins().ishl(hi3a, twelve);
+        let mid3a = bcx.ins().band(c1z, lo2);
+        let mid3 = bcx.ins().ishl(mid3a, six);
+        let lo3b = bcx.ins().band(c2z, lo2);
+        let mid3b = bcx.ins().bor(hi3, mid3);
+        let cp3 = bcx.ins().bor(mid3b, lo3b);
+        bcx.ins().jump(head_b, &[BlockArg::Value(cp3), BlockArg::Value(three)]);
+        bcx.switch_to_block(fb3);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+
+        // 4-byte lead: 11110xxx (and anything else is malformed).
+        bcx.switch_to_block(four_chk);
+        let lead4_mask = bcx.ins().iconst(types::I64, 0xF8);
+        let lead4_val = bcx.ins().iconst(types::I64, 0xF0);
+        let b04 = bcx.ins().band(b0z, lead4_mask);
+        let is4 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::Equal,
+            b04,
+            lead4_val,
+        );
+        let four_b = bcx.create_block();
+        let fb4 = bcx.create_block();
+        bcx.ins().brif(is4, four_b, &[], fb4, &[]);
+        bcx.switch_to_block(four_b);
+        let four = bcx.ins().iconst(types::I64, 4);
+        let len4 = bcx.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThanOrEqual,
+            slen,
+            four,
+        );
+        let four_ok = bcx.create_block();
+        let fb4b = bcx.create_block();
+        bcx.ins().brif(len4, four_ok, &[], fb4b, &[]);
+        bcx.switch_to_block(four_ok);
+        let d1 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 25);
+        let d1z = bcx.ins().uextend(types::I64, d1);
+        let d2 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 26);
+        let d2z = bcx.ins().uextend(types::I64, d2);
+        let d3 = bcx.ins().load(types::I8, MemFlagsData::new(), value, 27);
+        let d3z = bcx.ins().uextend(types::I64, d3);
+        let lo4 = bcx.ins().iconst(types::I64, 0x07);
+        let eighteen = bcx.ins().iconst(types::I64, 18);
+        let hi4a = bcx.ins().band(b0z, lo4);
+        let hi4 = bcx.ins().ishl(hi4a, eighteen);
+        let mid4a0 = bcx.ins().band(d1z, lo2);
+        let mid4a = bcx.ins().ishl(mid4a0, twelve);
+        let mid4b0 = bcx.ins().band(d2z, lo2);
+        let mid4b = bcx.ins().ishl(mid4b0, six);
+        let lo4c = bcx.ins().band(d3z, lo2);
+        let hi4b = bcx.ins().bor(hi4, mid4a);
+        let hi4c = bcx.ins().bor(hi4b, mid4b);
+        let cp4 = bcx.ins().bor(hi4c, lo4c);
+        bcx.ins().jump(head_b, &[BlockArg::Value(cp4), BlockArg::Value(four)]);
+        bcx.switch_to_block(fb4b);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+        bcx.switch_to_block(fb4);
+        bcx.ins().jump(head_b, &[BlockArg::Value(b0z), BlockArg::Value(one)]);
+
+        bcx.switch_to_block(head_b);
+        let char_box = box_char(bcx, cp_param, rt);
+        let call = bcx.ins().call(rt.str_tail_n, &[value, n_param]);
         let rest = bcx.inst_results(call)[0];
         bcx.ins().jump(merge_b, &[BlockArg::Value(char_box), BlockArg::Value(rest)]);
 
@@ -2787,9 +3128,9 @@ impl Compiler {
                 Ok(box_char(bcx, code, rt))
             }
             Expr::Unit(_) => {
-                // `()` has no native representation of its own; use a boxed 0.
-                let zero = bcx.ins().iconst(types::I64, 0);
-                Ok(box_int(bcx, zero, rt))
+                // `()` gets its own tag so `show`/`println` print `()`
+                // rather than `0`, matching the interpreter.
+                Ok(box_unit(bcx, rt))
             }
             // Under immutability + ARC, `clone`, `&`, and `*` are identities.
             Expr::Clone(e, _) | Expr::Borrow { expr: e, .. } | Expr::Deref(e, _) => {
@@ -2885,7 +3226,7 @@ impl Compiler {
                 let call = bcx.ins().call(rt.alloc, &[tag, nfields]);
                 Ok(bcx.inst_results(call)[0])
             }
-            Expr::Var(name, _) if name == "otherwise" => {
+            Expr::Var(name, _) if name == "otherwise" && !vars.contains_key(name) => {
                 // `otherwise` is the predefined constant `True` (used in guards).
                 let one = bcx.ins().iconst(types::I64, 1);
                 Ok(box_bool(bcx, one, rt))
@@ -3273,11 +3614,10 @@ impl Compiler {
         };
 
         if let Some(name) = head_name.as_deref() {
-            // A top-level function definition shadows a builtin of the same
-            // name — the interpreter replaces the prelude entry with the
-            // user's function the same way, so the builtin is only used when
-            // no user function exists.
-            if is_builtin(name) && !funcrefs.contains_key(name) {
+            // A top-level function definition or a local binding shadows a
+            // builtin of the same name — the interpreter resolves them the
+            // same way — so the builtin is only used when neither exists.
+            if is_builtin(name) && !funcrefs.contains_key(name) && !vars.contains_key(name) {
                 return self.gen_builtin(bcx, name, &args, vars, funcrefs, rt, cells, None);
             }
 
@@ -3658,14 +3998,12 @@ impl Compiler {
             "println" => {
                 bcx.ins().call(rt.println, &[vals[0]]);
                 release(bcx, rt, vals[0]);
-                let zero = bcx.ins().iconst(types::I64, 0);
-                Ok(box_int(bcx, zero, rt))
+                Ok(box_unit(bcx, rt))
             }
             "print" => {
                 bcx.ins().call(rt.print, &[vals[0]]);
                 release(bcx, rt, vals[0]);
-                let zero = bcx.ins().iconst(types::I64, 0);
-                Ok(box_int(bcx, zero, rt))
+                Ok(box_unit(bcx, rt))
             }
             "show" => {
                 let call = bcx.ins().call(rt.show, &[vals[0]]);
@@ -3718,10 +4056,14 @@ impl Compiler {
                 release(bcx, rt, vals[0]);
                 Ok(box_int(bcx, i, rt))
             }
-            "_readLine" => {
+            "_readLine" | "Std.IO._readLine" => {
                 // Internal for Std.IO: `None` at end of input, `Some line`
                 // otherwise. Std.IO imports Std.Option, so the constructors
-                // are always in the program when this is reached.
+                // are always in the program when this is reached. (The
+                // qualified form is what Std.IO's call site becomes after
+                // module flattening; source code can only ever reach the
+                // unqualified one if a user defines it, which is handled by
+                // the shadowing checks in gen_apply.)
                 let none_idx = self
                     .info
                     .ctor_of("Std.Option.None")
@@ -3851,6 +4193,7 @@ fn is_builtin(op: &str) -> bool {
             | "ceil"
             | "snoc"
             | "_readLine"
+            | "Std.IO._readLine"
     )
 }
 
@@ -3867,6 +4210,13 @@ fn box_int(bcx: &mut FunctionBuilder, v: Value, rt: Rt) -> Value {
 
 fn box_bool(bcx: &mut FunctionBuilder, v: Value, rt: Rt) -> Value {
     box_value(bcx, TAG_BOOL, v, rt)
+}
+
+/// Box the unit value `()` (payload unused) as a `TAG_UNIT` box so `show`
+/// can distinguish it from the integer 0.
+fn box_unit(bcx: &mut FunctionBuilder, rt: Rt) -> Value {
+    let zero = bcx.ins().iconst(types::I64, 0);
+    box_value(bcx, TAG_UNIT, zero, rt)
 }
 
 /// Box a character's byte value as a `TAG_CHAR` box.
