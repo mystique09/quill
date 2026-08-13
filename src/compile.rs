@@ -204,6 +204,7 @@ struct RtImports {
     ftoa: cranelift_module::FuncId,
     write: cranelift_module::FuncId,
     read_line_raw: cranelift_module::FuncId,
+    read_line_len: cranelift_module::FuncId,
 }
 
 impl Compiler {
@@ -235,7 +236,10 @@ impl Compiler {
         let itoa = self.declare_import("quill_itoa", &mut [types::I64], &mut [types::I64])?;
         let ftoa = self.declare_import("quill_ftoa", &mut [types::I64], &mut [types::I64])?;
         // Line-at-a-time stdin reads also live in the C runtime (getline(3)).
+        // The length comes back separately so embedded NUL bytes survive.
         let read_line_raw = self.declare_import("quill_read_line_raw", &mut [], &mut [types::I64])?;
+        let read_line_len =
+            self.declare_import("quill_read_line_raw_len", &mut [], &mut [types::I64])?;
 
         self.emit_runtime(RtImports {
             malloc,
@@ -247,6 +251,7 @@ impl Compiler {
             ftoa,
             write: write_import,
             read_line_raw,
+            read_line_len,
         })?;
 
         let mut func_ids: HashMap<String, cranelift_module::FuncId> = HashMap::new();
@@ -546,6 +551,7 @@ impl Compiler {
             ftoa,
             write: write_import,
             read_line_raw,
+            read_line_len,
         } = imports;
         // quill_alloc(tag, nfields) -> ptr
         {
@@ -1349,8 +1355,9 @@ impl Compiler {
         }
 
         // quill_read_line() -> str box, or 0 at end of input. The raw C
-        // helper returns a malloc'd NUL-terminated line (NULL at EOF); here
-        // it is copied into a string box and freed.
+        // helper returns a malloc'd NUL-terminated line (NULL at EOF) plus
+        // its length in a separate call — the length, not strlen, is used so
+        // embedded NUL bytes are preserved, matching the interpreter.
         {
             let target_config = self.module.target_config();
             let sig = plain_sig(0);
@@ -1362,8 +1369,8 @@ impl Compiler {
             ctx.func.name = UserFuncName::testcase("quill_read_line");
             ctx.func.signature = sig;
             let raw_ref = self.module.declare_func_in_func(read_line_raw, &mut ctx.func);
+            let len_ref = self.module.declare_func_in_func(read_line_len, &mut ctx.func);
             let free_ref = self.module.declare_func_in_func(free, &mut ctx.func);
-            let strlen_ref = self.module.declare_func_in_func(strlen, &mut ctx.func);
             let from_bytes_ref =
                 self.declare_rt_in(&mut ctx, "quill_str_from_bytes", &plain_sig(2));
             {
@@ -1385,7 +1392,7 @@ impl Compiler {
                 bcx.switch_to_block(eof_b);
                 bcx.ins().return_(&[zero]);
                 bcx.switch_to_block(line_b);
-                let call2 = bcx.ins().call(strlen_ref, &[ptr]);
+                let call2 = bcx.ins().call(len_ref, &[]);
                 let len = bcx.inst_results(call2)[0];
                 let call3 = bcx.ins().call(from_bytes_ref, &[ptr, len]);
                 let boxed = bcx.inst_results(call3)[0];
@@ -3737,6 +3744,9 @@ impl Compiler {
                     .info
                     .ctor_of("Std.Option.Some")
                     .ok_or_else(|| "`_readLine` requires Std.Option (import Std.IO)".to_string())?;
+                // The `()` argument is a freshly boxed unit; the intrinsic
+                // does not use it, so release it like the other builtins do.
+                release(bcx, rt, vals[0]);
                 let call = bcx.ins().call(rt.read_line, &[]);
                 let s = bcx.inst_results(call)[0];
                 let zero = bcx.ins().iconst(types::I64, 0);
