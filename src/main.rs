@@ -62,14 +62,23 @@ fn build(args: &[String]) {
                 eprintln!("error: could not write `{}`: {e}", obj_path.display());
                 std::process::exit(1);
             }
+            // The compiled object imports number-formatting helpers from the C
+            // runtime; compile and link it alongside.
+            let rt_path = obj_path.with_extension("rt.c");
+            if let Err(e) = std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")) {
+                eprintln!("error: could not write `{}`: {e}", rt_path.display());
+                std::process::exit(1);
+            }
             let status = std::process::Command::new("cc")
                 .arg(&obj_path)
+                .arg(&rt_path)
                 .arg("-o")
                 .arg(&out_path)
                 .status();
             match status {
                 Ok(s) if s.success() => {
                     let _ = std::fs::remove_file(&obj_path);
+                    let _ = std::fs::remove_file(&rt_path);
                     println!("built {}", out_path.display());
                 }
                 Ok(s) => {
