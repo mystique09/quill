@@ -709,6 +709,7 @@ impl Infer {
 
         let a = self.new_var();
         prelude.push(("println".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::unit()) }));
+        prelude.push(("print".into(), Scheme { vars: vec![a], constraints: vec![], ty: Ty::func(Ty::Var(a), Ty::unit()) }));
         prelude.push(("sqrt".into(), Scheme::mono(Ty::func(Ty::float(), Ty::float()))));
         prelude.push(("chr".into(), Scheme::mono(Ty::func(Ty::int(), Ty::char()))));
         prelude.push(("snoc".into(), Scheme::mono(Ty::func(Ty::string(), Ty::func(Ty::char(), Ty::string())))));

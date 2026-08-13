@@ -55,6 +55,7 @@ enum Builtin {
     Append,
     Show,
     Println,
+    Print,
     Error,
     Sqrt,
     Chr,
@@ -747,6 +748,12 @@ impl<'a> Eval<'a> {
                 self.output.borrow_mut().push('\n');
                 Ok(Value::Unit)
             }
+            // `print` is `println` without the trailing newline; the native
+            // backend streams it to stdout immediately.
+            Builtin::Print => {
+                self.output.borrow_mut().push_str(&format_value(&args[0]));
+                Ok(Value::Unit)
+            }
             Builtin::Error => {
                 let msg = match &args[0] {
                     Value::Str(s) => s.clone(),
@@ -1085,6 +1092,7 @@ fn install_prelude(global: &mut Scope, info: &ProgramInfo) {
         ("++", Builtin::Append),
         ("show", Builtin::Show),
         ("println", Builtin::Println),
+        ("print", Builtin::Print),
         ("error", Builtin::Error),
         ("sqrt", Builtin::Sqrt),
         ("chr", Builtin::Chr),

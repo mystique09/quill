@@ -169,13 +169,15 @@ main = let mut total = 0
 ## The prelude
 
 The primitive builtins: `+ - * / % negate`, `== /= < <= > >=`, `&& || not`,
-`:`, `++`, `show println error sqrt chr snoc`, `otherwise`.
+`:`, `++`, `show println print error sqrt chr snoc`, `otherwise`.
 
 `==`, `<`, and `show` are structural and work on any value; `+` requires the
 `Num` class and `++` the `Append` class. The list functions (`map`, `filter`,
 `foldl`, `foldr`, `head`, `tail`, `length`, `reverse`, `sum`, …) are ordinary
 Quill code in `Std.List`, which is imported implicitly.
 
+`print` is `println` without the trailing newline; in compiled binaries it
+streams to stdout immediately (the tree-walking interpreter still buffers).
 Strings support cons patterns: `(c:cs)` destructures a string into its first
 character and the rest (when the pattern's type is `String`). `chr` maps a
 byte (mod 256) to its `Char`, and `snoc` appends a `Char` to a `String` —

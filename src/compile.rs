@@ -125,6 +125,7 @@ struct Rt {
     release: FuncRef,
     str_alloc: FuncRef,
     println: FuncRef,
+    print: FuncRef,
     cons: FuncRef,
     append: FuncRef,
     make_closure: FuncRef,
@@ -208,12 +209,18 @@ impl Compiler {
         let memcpy = self.declare_import("memcpy", &mut [types::I64, types::I64, types::I64], &mut [types::I64])?;
         let puts = self.declare_import("puts", &mut [types::I64], &mut [types::I64])?;
         let strlen = self.declare_import("strlen", &mut [types::I64], &mut [types::I64])?;
+        // `print` streams bytes straight to stdout via write(2).
+        let write_import = self.declare_import(
+            "write",
+            &mut [types::I64, types::I64, types::I64],
+            &mut [types::I64],
+        )?;
         // Number formatting lives in the C runtime (runtime/quill-rt.c): it
         // needs variadic `snprintf`, which Cranelift's fixed ABI cannot drive.
         let itoa = self.declare_import("quill_itoa", &mut [types::I64], &mut [types::I64])?;
         let ftoa = self.declare_import("quill_ftoa", &mut [types::I64], &mut [types::I64])?;
 
-        self.emit_runtime(malloc, free, memcpy, puts, strlen, itoa, ftoa)?;
+        self.emit_runtime(malloc, free, memcpy, puts, strlen, itoa, ftoa, write_import)?;
 
         let mut func_ids: HashMap<String, cranelift_module::FuncId> = HashMap::new();
         for item in &program.items {
@@ -510,6 +517,7 @@ impl Compiler {
         strlen: cranelift_module::FuncId,
         itoa: cranelift_module::FuncId,
         ftoa: cranelift_module::FuncId,
+        write_import: cranelift_module::FuncId,
     ) -> Result<(), String> {
         // quill_alloc(tag, nfields) -> ptr
         {
@@ -735,6 +743,54 @@ impl Compiler {
             self.module
                 .define_function(id, &mut ctx)
                 .map_err(|e| format!("define quill_println: {e}"))?;
+        }
+
+        // quill_print(s) — write the string's bytes to stdout (no newline),
+        // so `.` output appears as it is produced.
+        {
+            let target_config = self.module.target_config();
+            let mut sig = Signature::new(CallConv::SystemV);
+            sig.params.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("quill_print", Linkage::Local, &sig)
+                .map_err(|e| format!("declare quill_print: {e}"))?;
+            let mut ctx = self.module.make_context();
+            ctx.func.name = UserFuncName::testcase("quill_print");
+            ctx.func.signature = sig;
+            let write_ref = self.module.declare_func_in_func(write_import, &mut ctx.func);
+            {
+                let mut fctx = FunctionBuilderContext::new();
+                let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+                let block = bcx.create_block();
+                bcx.switch_to_block(block);
+                bcx.append_block_params_for_function_params(block);
+                let p = bcx.block_params(block)[0];
+                // Trap on non-strings, like quill_println.
+                let tag = bcx.ins().load(types::I64, MemFlagsData::new(), p, 8);
+                let str_tag = bcx.ins().iconst(types::I64, TAG_STR);
+                let is_str = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    tag,
+                    str_tag,
+                );
+                let ok = bcx.create_block();
+                let bad = bcx.create_block();
+                bcx.ins().brif(is_str, ok, &[], bad, &[]);
+                bcx.switch_to_block(bad);
+                bcx.ins().trap(TrapCode::unwrap_user(3));
+                bcx.switch_to_block(ok);
+                let len = bcx.ins().load(types::I64, MemFlagsData::new(), p, 16);
+                let data = bcx.ins().iadd_imm_s(p, 24);
+                let one = bcx.ins().iconst(types::I64, 1);
+                bcx.ins().call(write_ref, &[one, data, len]);
+                bcx.ins().return_(&[]);
+                bcx.seal_all_blocks();
+                bcx.finalize(target_config);
+            }
+            self.module
+                .define_function(id, &mut ctx)
+                .map_err(|e| format!("define quill_print: {e}"))?;
         }
 
         // quill_cons(head, tail) -> ptr — a list cons cell.
@@ -1954,7 +2010,6 @@ impl Compiler {
         ctx.func.signature = sig;
         let callee = self.module.declare_func_in_func(main_id, &mut ctx.func);
         let alloc_ref = self.declare_rt_in(&mut ctx, "quill_alloc", &plain_sig(2));
-        let release_ref = self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1));
         {
             let mut func_ctx = FunctionBuilderContext::new();
             let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
@@ -2068,6 +2123,7 @@ impl Compiler {
             release: self.declare_rt_in(&mut ctx, "quill_release", &unit_sig(1)),
             str_alloc: self.declare_rt_in(&mut ctx, "quill_str_alloc", &plain_sig(1)),
             println: self.declare_rt_in(&mut ctx, "quill_println", &unit_sig(1)),
+            print: self.declare_rt_in(&mut ctx, "quill_print", &unit_sig(1)),
             cons: self.declare_rt_in(&mut ctx, "quill_cons", &plain_sig(2)),
             append: self.declare_rt_in(&mut ctx, "quill_append", &plain_sig(2)),
             make_closure: self.declare_rt_in(&mut ctx, "quill_make_closure", &plain_sig(5)),
@@ -3532,6 +3588,12 @@ impl Compiler {
                 let zero = bcx.ins().iconst(types::I64, 0);
                 Ok(box_int(bcx, zero, rt))
             }
+            "print" => {
+                bcx.ins().call(rt.print, &[vals[0]]);
+                release(bcx, rt, vals[0]);
+                let zero = bcx.ins().iconst(types::I64, 0);
+                Ok(box_int(bcx, zero, rt))
+            }
             "show" => {
                 let call = bcx.ins().call(rt.show, &[vals[0]]);
                 let r = bcx.inst_results(call)[0];
@@ -3641,6 +3703,7 @@ fn is_builtin(op: &str) -> bool {
             | "++"
             | ":"
             | "println"
+            | "print"
             | "show"
             | "error"
             | "chr"
