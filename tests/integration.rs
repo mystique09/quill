@@ -768,3 +768,171 @@ fn native_println_any_value() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn native_local_builtin_shadowing() {
+    let dir = std::env::temp_dir().join("quill_native_local_shadow_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shadow.q");
+    std::fs::write(
+        &path,
+        "main = let ord = \\_ -> 42 in let otherwise = 7 in println (show (ord 'A' + otherwise))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("shadow.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("shadow");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "49\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compiled unit values print `()` (the interpreter's format), not `0`.
+/// Link-and-run; skipped when no C compiler is available.
+#[test]
+fn native_unit_formatting() {
+    let dir = std::env::temp_dir().join("quill_native_unit_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("u.q");
+    std::fs::write(
+        &path,
+        "main = let _ = println () in let _ = println (show ()) in println (show (() == ()))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("u.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("u");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "()\n()\ntrue\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compiled string cons patterns decode full UTF-8 characters, so `toChars`
+/// matches the interpreter on non-ASCII input. Link-and-run; skipped when no
+/// C compiler is available.
+#[test]
+fn native_utf8_tochars() {
+    let dir = std::env::temp_dir().join("quill_native_utf8_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("utf8.q");
+    std::fs::write(
+        &path,
+        "use Std.String as S\n\
+         main = println (show (length (S.toChars \"é\")) ++ \" \" ++ show (S.toChars \"aé中\") ++ \" \" ++ S.fromChars (S.toChars \"héllo\"))\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("utf8.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("utf8");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    let output = std::process::Command::new(&bin_path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1 ['a', 'é', '中'] héllo\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stdin read error (closed stdin) traps in compiled programs instead of
+/// being silently reported as end of input. Skipped without a C toolchain or
+/// a POSIX shell.
+#[cfg(unix)]
+#[test]
+fn native_readline_error_traps() {
+    let dir = std::env::temp_dir().join("quill_native_rlerr_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rlerr.q");
+    std::fs::write(
+        &path,
+        "use Std.IO as IO\n\
+         use Std.Option\n\
+         main = println (case IO.readLine () of { None -> \"eof\"; Some l -> l })\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("rlerr.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("rlerr");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    // Close stdin before running the binary: getline fails with EBADF, which
+    // must trap rather than yield None ("eof").
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("exec 0<&-; exec {}", bin_path.display()))
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "expected the read error to trap, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
