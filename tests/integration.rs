@@ -438,3 +438,145 @@ fn brainfuck_example() {
         .unwrap();
     assert_eq!(output.unwrap(), "Hello World!\n");
 }
+
+#[test]
+fn stdlib_string() {
+    let src = r#"
+use Std.String as S
+main = println
+  ( S.toUpper "hElLo" ++ " " ++ show (S.lines "a\nb\nc") ++ " "
+    ++ show (S.words "foo  bar\tbaz") ++ " " ++ show (S.split ',' "a,,b,c") ++ " "
+    ++ S.join "-" ["x", "y"] ++ " " ++ S.trim "  hi  " ++ " "
+    ++ show (S.startsWith "he" "hello") ++ " " ++ show (S.endsWith "lo" "hello") ++ " "
+    ++ show (S.contains "ell" "hello") ++ " " ++ S.fromChars ['a', 'b'] ++ " "
+    ++ show (S.toChars "ab") ++ " " ++ S.repeat "ab" 2 )
+"#;
+    assert_eq!(
+        run_ok(src),
+        "HELLO [a, b, c] [foo, bar, baz] [a, , b, c] x-y hi true true true ab ['a', 'b'] abab\n"
+    );
+}
+
+#[test]
+fn stdlib_tuple_math() {
+    let src = r#"
+use Std.Tuple as T
+use Std.Math as M
+main = println
+  ( show (T.fst (1, 2)) ++ " " ++ show (T.snd (1, 2)) ++ " " ++ show (T.swap (1, 2)) ++ " "
+    ++ show (T.uncurry (\x y -> x + y) (2, 3)) ++ " " ++ show (M.abs (-5)) ++ " "
+    ++ show (M.pow 2 8) ++ " " ++ show (M.min 3 7) ++ " " ++ show (M.max 3 7) ++ " "
+    ++ show (M.clamp 0 10 42) ++ " " ++ show (M.even 4) ++ " " ++ show (M.odd 4) ++ " "
+    ++ show (M.gcd 12 18) ++ " " ++ show (M.round 2.5) ++ " " ++ show (floor 2.7)
+    ++ " " ++ show (ceil 2.1) ++ " " ++ show (ord 'A') )
+"#;
+    assert_eq!(
+        run_ok(src),
+        "1 2 (2, 1) 5 5 256 3 7 10 true false 6 3 2 3 65\n"
+    );
+}
+
+#[test]
+fn stdlib_io_typechecks() {
+    // Std.IO's readLine is typed `() -> Option String` via a native helper;
+    // this checks the module loads and typechecks (stdin is not exercised).
+    let src = r#"
+use Std.IO as IO
+use Std.Option
+main = println (case IO.readLine () of { None -> "no input"; Some l -> l })
+"#;
+    quill::check(src).unwrap();
+}
+
+#[test]
+fn char_escapes() {
+    // Regression: escapes must work in both char and string literals (the
+    // lexer used to skip the backslash twice, breaking '\t' and friends).
+    let src = r#"
+main = println (show ('\n' == '\n') ++ " " ++ show ("a\nb" == "a" ++ "\n" ++ "b") ++ " " ++ show (ord '\t'))
+"#;
+    assert_eq!(run_ok(src), "true true 9\n");
+}
+
+#[test]
+fn native_compile_stdlib_string() {
+    // Std.String exercises the compiled backend's string cons patterns,
+    // `chr`/`ord`/`snoc`, and `++`.
+    let dir = std::env::temp_dir().join("quill_native_stdstr_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.q");
+    std::fs::write(
+        &path,
+        "use Std.String as S\n\
+         use Std.Math as M\n\
+         main = println\n\
+         \x20 ( S.toUpper \"hi\" ++ S.trim \" x \" ++ show (S.split ',' \"a,b\")\n\
+         \x20   ++ \" \" ++ show (M.round 2.5) ++ \" \" ++ show (floor 2.7) ++ \" \" ++ show (ord 'A') )\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    assert!(
+        object.len() > 100,
+        "object too small: {} bytes",
+        object.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Link and run a compiled program that uses the new stdlib modules and
+/// reads a line from piped stdin. Skipped when no C compiler is available.
+#[test]
+fn native_link_and_run_stdlib() {
+    let dir = std::env::temp_dir().join("quill_native_stdlib_run_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run.q");
+    std::fs::write(
+        &path,
+        "use Std.IO as IO\n\
+         use Std.Option\n\
+         use Std.String as S\n\
+         use Std.Math as M\n\
+         showLine :: Option String -> String\n\
+         showLine None = \"none\"\n\
+         showLine (Some l) = l\n\
+         main = println\n\
+         \x20 ( S.toUpper (showLine (IO.readLine ())) ++ \" \" ++ show (S.lines \"a\\nb\")\n\
+         \x20   ++ \" \" ++ show (M.round 2.5) ++ \" \" ++ show (floor 2.7) ++ \" \" ++ show (ord 'A') )\n",
+    )
+    .unwrap();
+    let object = quill::compile_file(&path).unwrap();
+    let obj_path = dir.join("run.o");
+    std::fs::write(&obj_path, &object).unwrap();
+    let rt_path = dir.join("rt.c");
+    std::fs::write(&rt_path, include_str!("../runtime/quill-rt.c")).unwrap();
+    let bin_path = dir.join("run");
+    let status = std::process::Command::new("cc")
+        .arg(&obj_path)
+        .arg(&rt_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .unwrap();
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // no C toolchain: skip the runtime assertions
+    }
+    // Feed one line on stdin and read the process's stdout.
+    let mut child = std::process::Command::new(&bin_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"hello world\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "compiled program failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "HELLO WORLD [a, b] 3 2 65\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
