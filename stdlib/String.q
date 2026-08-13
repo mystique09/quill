@@ -108,5 +108,4 @@ toChars ""     = []
 toChars (c:cs) = c : toChars cs
 
 repeat :: String -> Int -> String
-repeat s 0 = ""
-repeat s n = s ++ repeat s (n - 1)
+repeat s n = if n <= 0 then "" else s ++ repeat s (n - 1)

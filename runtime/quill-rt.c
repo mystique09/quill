@@ -67,12 +67,58 @@ char *quill_ftoa(long bits) {
 }
 
 /* Read one line of stdin without its trailing newline/CR. Returns NULL at
- * end of input and (char *)-1 on a read error (so the caller can trap,
- * mirroring the interpreter's readLine error). The returned buffer is
- * malloc'd; the caller boxes it and frees it. The length (which can include
- * embedded NUL bytes) is stashed in `quill_line_len`, because the caller
- * cannot recover it with strlen. */
+ * end of input and (char *)-1 on a read error or invalid UTF-8 (so the
+ * caller can trap, mirroring the interpreter's readLine errors). The
+ * returned buffer is malloc'd; the caller boxes it and frees it. The length
+ * (which can include embedded NUL bytes) is stashed in `quill_line_len`,
+ * because the caller cannot recover it with strlen. */
 static ssize_t quill_line_len = 0;
+
+/* Is `line[0..n]` valid UTF-8 (rejecting overlong encodings, surrogates,
+ * and code points above U+10FFFF, like Rust's String)? */
+static int quill_utf8_valid(const char *line, ssize_t n) {
+    ssize_t i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)line[i];
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+        int cont;
+        unsigned long cp;
+        unsigned long min;
+        if ((c & 0xE0) == 0xC0) {
+            cont = 1;
+            cp = c & 0x1F;
+            min = 0x80;
+        } else if ((c & 0xF0) == 0xE0) {
+            cont = 2;
+            cp = c & 0x0F;
+            min = 0x800;
+        } else if ((c & 0xF8) == 0xF0) {
+            cont = 3;
+            cp = c & 0x07;
+            min = 0x10000;
+        } else {
+            return 0;
+        }
+        if (i + cont + 1 > n) {
+            return 0; /* truncated sequence */
+        }
+        for (int k = 1; k <= cont; k++) {
+            unsigned char cc = (unsigned char)line[i + k];
+            if ((cc & 0xC0) != 0x80) {
+                return 0;
+            }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return 0;
+        }
+        i += cont + 1;
+    }
+    return 1;
+}
 
 char *quill_read_line_raw(void) {
     char *line = NULL;
@@ -85,6 +131,11 @@ char *quill_read_line_raw(void) {
     }
     while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
         line[--n] = '\0';
+    }
+    if (!quill_utf8_valid(line, n)) {
+        free(line);
+        quill_line_len = 0;
+        return (char *)-1;
     }
     quill_line_len = n;
     return line;

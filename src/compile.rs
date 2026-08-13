@@ -172,6 +172,7 @@ pub fn compile_object(program: &Program, types: &TypeInfo) -> Result<Vec<u8>, St
         method_dispatch: HashMap::new(),
         instances: types.instances.clone(),
         adts: types.adts.clone(),
+        builtin_values: HashMap::new(),
     };
     c.collect_signatures(program)?;
     c.compile_program(program)
@@ -195,6 +196,10 @@ struct Compiler {
     method_dispatch: HashMap<String, Vec<(Vec<usize>, cranelift_module::FuncId)>>,
     instances: Vec<InstanceInfo>,
     adts: Vec<crate::infer::AdtDef>,
+    /// Builtin name -> synthesized wrapper function (`\x -> ord x`, …) so
+    /// builtins can be used as first-class values, like the interpreter's
+    /// prelude.
+    builtin_values: HashMap<String, String>,
 }
 
 /// Imported libc/C-runtime helpers handed to `emit_runtime`.
@@ -328,6 +333,56 @@ impl Compiler {
                 },
                 free_vars,
                 cell_vars,
+            ));
+        }
+
+        // Builtins used as values (e.g. `map ord ['A']`): synthesize a
+        // wrapper function per builtin (`\x -> ord x`, `\x y -> x + y`, …)
+        // and remember the mapping so the Var-as-value path can materialize
+        // a closure, like the interpreter's prelude does. The internal
+        // `_readLine` intrinsic is not usable as a value and is skipped.
+        let builtins: [(&str, usize); 27] = [
+            ("+", 2), ("-", 2), ("*", 2), ("/", 2), ("%", 2), ("negate", 1),
+            ("==", 2), ("/=", 2), ("<", 2), ("<=", 2), (">", 2), (">=", 2),
+            ("&&", 2), ("||", 2), ("not", 1), ("++", 2), (":", 2),
+            ("println", 1), ("print", 1), ("show", 1), ("error", 1),
+            ("sqrt", 1), ("chr", 1), ("ord", 1), ("floor", 1), ("ceil", 1),
+            ("snoc", 2),
+        ];
+        for (i, (bname, arity)) in builtins.iter().enumerate() {
+            let fname = format!("q_builtin_{i}");
+            let pats: Vec<Pattern> = (0..*arity)
+                .map(|k| Pattern::Var(format!("$b{k}"), crate::error::Span::default()))
+                .collect();
+            let mut body = Expr::Var((*bname).to_string(), crate::error::Span::default());
+            for k in 0..*arity {
+                body = Expr::App(
+                    Box::new(body),
+                    Box::new(Expr::Var(
+                        format!("$b{k}"),
+                        crate::error::Span::default(),
+                    )),
+                    crate::error::Span::default(),
+                );
+            }
+            self.arities.insert(fname.clone(), *arity);
+            self.builtin_values.insert((*bname).to_string(), fname.clone());
+            let id = self
+                .module
+                .declare_function(&fname, Linkage::Local, &fn_sig(2))
+                .map_err(|e| format!("declare {fname}: {e}"))?;
+            func_ids.insert(fname.clone(), id);
+            lambda_fns.push((
+                Function {
+                    name: fname,
+                    clauses: vec![Clause {
+                        pats,
+                        body,
+                        span: crate::error::Span::default(),
+                    }],
+                },
+                Vec::new(),
+                std::collections::HashSet::new(),
             ));
         }
 
@@ -3256,6 +3311,16 @@ impl Compiler {
                         let nil = make_nil(bcx, rt);
                         Ok(make_closure(bcx, arity, func_ref, nil, rt))
                     }
+                } else if let Some(synth) = self.builtin_values.get(name) {
+                    // A builtin used as a value: materialize its wrapper
+                    // function as a closure, like the interpreter's prelude.
+                    let func_ref = funcrefs
+                        .get(synth)
+                        .copied()
+                        .ok_or_else(|| format!("unbound `{name}`"))?;
+                    let arity = self.arities.get(synth).copied().unwrap_or(0);
+                    let nil = make_nil(bcx, rt);
+                    Ok(make_closure(bcx, arity, func_ref, nil, rt))
                 } else {
                     Err(format!("unbound `{name}`"))
                 }
@@ -4056,6 +4121,39 @@ impl Compiler {
                 release(bcx, rt, vals[0]);
                 Ok(box_int(bcx, i, rt))
             }
+            "sqrt" => {
+                // Like the interpreter's `sqrt`, accept Int (promoting to
+                // Float) and Float.
+                let tag = tag_of(bcx, vals[0]);
+                let int_tag = bcx.ins().iconst(types::I64, TAG_INT);
+                let is_int = bcx.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    tag,
+                    int_tag,
+                );
+                let int_block = bcx.create_block();
+                let float_block = bcx.create_block();
+                let merge_block = bcx.create_block();
+                let merge_param = bcx.append_block_param(merge_block, types::I64);
+                bcx.ins().brif(is_int, int_block, &[], float_block, &[]);
+                bcx.switch_to_block(int_block);
+                let i = unbox(bcx, vals[0]);
+                let f = bcx.ins().fcvt_from_sint(types::F64, i);
+                let fr = bcx.ins().sqrt(f);
+                let boxed = box_float(bcx, fr, rt);
+                bcx.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+                bcx.switch_to_block(float_block);
+                let f2 = unbox_float(bcx, vals[0]);
+                let fr2 = bcx.ins().sqrt(f2);
+                let boxed2 = box_float(bcx, fr2, rt);
+                bcx.ins().jump(merge_block, &[BlockArg::Value(boxed2)]);
+                bcx.seal_block(int_block);
+                bcx.seal_block(float_block);
+                bcx.seal_block(merge_block);
+                bcx.switch_to_block(merge_block);
+                release(bcx, rt, vals[0]);
+                Ok(merge_param)
+            }
             "_readLine" | "Std.IO._readLine" => {
                 // Internal for Std.IO: `None` at end of input, `Some line`
                 // otherwise. Std.IO imports Std.Option, so the constructors
@@ -4187,6 +4285,7 @@ fn is_builtin(op: &str) -> bool {
             | "print"
             | "show"
             | "error"
+            | "sqrt"
             | "chr"
             | "ord"
             | "floor"
